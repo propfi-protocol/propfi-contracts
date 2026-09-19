@@ -1,0 +1,16 @@
+[package]
+name = "propfi-compliance-registry"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = "21"
+propfi-types = { path = "../types" }
+
+[dev-dependencies]
+soroban-sdk = { version = "21", features = ["testutils"] }
+
