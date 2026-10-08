@@ -154,16 +154,17 @@ docs(README): update deployment instructions
 2. Create `contracts/<name>/src/lib.rs` with a module structure.
 3. Add the contract to the workspace `Cargo.toml`.
 4. Implement `initialize`, core functions, events, and tests.
-5. Add integration test coverage in `tests/integration/`.
+5. Add integration test coverage in `contracts/integration_tests/tests/integration.rs`.
 
 ### Cross-contract dependencies
 
 When your contract calls another PropFi contract:
 
-1. Import the client: `use crate::property_registry::ContractClient as PropertyRegistryClient;`
-2. Pass the contract address as a function parameter.
-3. Gate sensitive operations with `ComplianceRegistryClient::is_compliant()`.
-4. Add the dependency to `Cargo.toml` (path dependency).
+1. Add the dependency to `Cargo.toml` as a path dependency (see any existing contract's `Cargo.toml` as an example).
+2. Import the generated client: `use propfi_property_registry::PropertyRegistryClient;`
+3. Pass the contract address as a function parameter — never hardcode contract IDs.
+4. Gate sensitive operations with `ComplianceRegistryClient::is_compliant()`.
+5. Use `env.invoke_contract()` for cross-contract calls, or the generated `Client` struct.
 
 ### Event naming
 
