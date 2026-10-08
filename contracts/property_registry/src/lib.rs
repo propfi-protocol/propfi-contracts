@@ -18,6 +18,7 @@ pub enum PropertyRegistryError {
     OraclePriceNotAvailable = 6,
     ValuationOutOfRange = 7,
     OraclePriceStale = 8,
+    NoPendingAdminTransfer = 9,
 }
 
 #[derive(Clone)]
@@ -27,6 +28,8 @@ pub enum DataKey {
     PropertyCounter,
     Property(u64),
     Jurisdiction(u64),
+    /// Pending admin awaiting acceptance (two-step transfer).
+    PendingAdmin,
 }
 
 #[contract]
@@ -259,6 +262,45 @@ impl PropertyRegistry {
             .instance()
             .get(&DataKey::Jurisdiction(prop_id))
             .ok_or(PropertyRegistryError::PropertyNotFound)
+    }
+
+    /// Initiates a two-step admin transfer. The current admin nominates a new admin
+    /// address, which must call `accept_admin()` to complete the handover.
+    pub fn propose_admin(
+        env: Env,
+        new_admin: Address,
+    ) -> Result<(), PropertyRegistryError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(PropertyRegistryError::Unauthorized)?;
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin.clone());
+
+        env.events()
+            .publish((Symbol::new(&env, "AdminTransferProposed"),), (admin, new_admin));
+        Ok(())
+    }
+
+    /// Completes the two-step admin transfer. The pending admin must call this.
+    pub fn accept_admin(env: Env) -> Result<(), PropertyRegistryError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(PropertyRegistryError::NoPendingAdminTransfer)?;
+        pending.require_auth();
+
+        env.storage().instance().set(&DataKey::Admin, &pending);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        env.events()
+            .publish((Symbol::new(&env, "AdminTransferred"),), pending);
+        Ok(())
     }
 }
 
@@ -652,6 +694,31 @@ mod test {
 
         // update_valuation should now reject the stale price
         let result = client.try_update_valuation(&prop_id, &100_000, &oracle_id, &asset);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_two_step_admin_transfer() {
+        let (env, _admin, client) = setup_property_registry();
+        let new_admin = Address::generate(&env);
+
+        // Step 1: current admin proposes new admin
+        client.propose_admin(&new_admin);
+
+        // Step 2: new admin accepts
+        client.accept_admin();
+
+        // New admin can now register a property (admin-gated action)
+        let owner = Address::generate(&env);
+        let doc_hash = soroban_sdk::BytesN::from_array(&env, &[2u8; 32]);
+        let prop_id = client.register_property(&owner, &50_000i128, &doc_hash, &Symbol::new(&env, "US"));
+        assert_eq!(prop_id, 1);
+    }
+
+    #[test]
+    fn test_accept_admin_without_proposal_returns_error() {
+        let (_env, _admin, client) = setup_property_registry();
+        let result = client.try_accept_admin();
         assert!(result.is_err());
     }
 }

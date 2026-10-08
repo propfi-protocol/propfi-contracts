@@ -18,6 +18,7 @@ pub enum FractionVaultError {
     PriceTooLow = 10,
     SupplyExceeded = 11,
     PropertyNotActive = 12,
+    NoPendingAdminTransfer = 13,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -39,6 +40,8 @@ pub enum DataKey {
     HolderCount(u64),
     IsHolder(Address, u64),
     MintedSupply(u64),
+    /// Pending admin awaiting acceptance (two-step transfer).
+    PendingAdmin,
 }
 
 #[contract]
@@ -173,6 +176,45 @@ impl FractionVault {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "rent_distributor"), &distributor);
+        Ok(())
+    }
+
+    /// Initiates a two-step admin transfer. The current admin nominates a new admin
+    /// address, which must call `accept_admin()` to complete the handover.
+    pub fn propose_admin(
+        env: Env,
+        new_admin: Address,
+    ) -> Result<(), FractionVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(FractionVaultError::Unauthorized)?;
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin.clone());
+
+        env.events()
+            .publish((Symbol::new(&env, "AdminTransferProposed"),), (admin, new_admin));
+        Ok(())
+    }
+
+    /// Completes the two-step admin transfer. The pending admin must call this.
+    pub fn accept_admin(env: Env) -> Result<(), FractionVaultError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(FractionVaultError::NoPendingAdminTransfer)?;
+        pending.require_auth();
+
+        env.storage().instance().set(&DataKey::Admin, &pending);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        env.events()
+            .publish((Symbol::new(&env, "AdminTransferred"),), pending);
         Ok(())
     }
 
@@ -893,5 +935,39 @@ mod test {
         prop_reg_client.set_status(&prop_id, &propfi_types::PropertyStatus::Active);
         vault.buy_fraction(&buyer, &prop_id, &10u128);
         assert_eq!(vault.get_balance(&buyer, &prop_id), 10);
+    }
+
+    #[test]
+    fn test_two_step_admin_transfer() {
+        let (env, admin, _owner) = setup_base();
+        let vault = setup_vault(&env, &admin);
+        let new_admin = Address::generate(&env);
+
+        // Step 1: current admin proposes
+        vault.propose_admin(&new_admin);
+
+        // Step 2: new admin accepts
+        vault.accept_admin();
+
+        // New admin can now fractionalize (admin-gated action)
+        let (prop_id, prop_reg_id, compliance_id) = register_property(&env, &admin, &_owner);
+        let token = Address::generate(&env);
+        vault.fractionalize(
+            &prop_id,
+            &500u128,
+            &10i128,
+            &token,
+            &prop_reg_id,
+            &compliance_id,
+        );
+        assert_eq!(vault.minted_supply(&prop_id), 0);
+    }
+
+    #[test]
+    fn test_accept_admin_without_proposal_returns_error() {
+        let (env, admin, _owner) = setup_base();
+        let vault = setup_vault(&env, &admin);
+        let result = vault.try_accept_admin();
+        assert!(result.is_err());
     }
 }

@@ -15,6 +15,7 @@ pub enum ComplianceRegistryError {
     Unauthorized = 2,
     AttestationNotFound = 3,
     UserNotCompliant = 4,
+    NoPendingAdminTransfer = 5,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -38,6 +39,8 @@ pub enum DataKey {
     Attestation(Address, Symbol),
     JurisdictionRules(Symbol),
     Admin,
+    /// Pending admin awaiting acceptance (two-step transfer).
+    PendingAdmin,
 }
 
 const DAY: u64 = 86400;
@@ -193,6 +196,47 @@ impl ComplianceRegistry {
         env.storage()
             .instance()
             .get(&DataKey::Attestation(user, jurisdiction))
+    }
+
+    /// Initiates a two-step admin transfer. The current admin nominates a new admin
+    /// address, which must call `accept_admin()` to complete the handover.
+    /// Emits an `AdminTransferProposed` event.
+    pub fn propose_admin(
+        env: Env,
+        new_admin: Address,
+    ) -> Result<(), ComplianceRegistryError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(ComplianceRegistryError::Unauthorized)?;
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin.clone());
+
+        env.events()
+            .publish((Symbol::new(&env, "AdminTransferProposed"),), (admin, new_admin));
+        Ok(())
+    }
+
+    /// Completes the two-step admin transfer. The pending admin must call this to
+    /// become the new admin. Emits an `AdminTransferred` event.
+    pub fn accept_admin(env: Env) -> Result<(), ComplianceRegistryError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(ComplianceRegistryError::NoPendingAdminTransfer)?;
+        pending.require_auth();
+
+        env.storage().instance().set(&DataKey::Admin, &pending);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        env.events()
+            .publish((Symbol::new(&env, "AdminTransferred"),), pending);
+        Ok(())
     }
 }
 
@@ -391,6 +435,61 @@ mod test {
         let (env, _admin, _user, client) = setup();
         let rogue_admin = Address::generate(&env);
         let result = client.try_initialize(&rogue_admin);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_two_step_admin_transfer() {
+        let (env, _admin, _user, client) = setup();
+        let new_admin = Address::generate(&env);
+
+        // Step 1: current admin proposes the new admin
+        client.propose_admin(&new_admin);
+
+        // New admin cannot yet attest (still the old admin)
+        // Step 2: new admin accepts
+        client.accept_admin();
+
+        // New admin can now perform admin actions
+        let user2 = Address::generate(&env);
+        let proof = Bytes::from_slice(&env, b"proof");
+        let jurisdiction = Symbol::new(&env, "US");
+        client.attest(&user2, &proof, &jurisdiction, &365u32);
+        assert!(client.is_compliant(&user2, &jurisdiction));
+    }
+
+    #[test]
+    fn test_accept_admin_without_proposal_returns_error() {
+        let (_env, _admin, _user, client) = setup();
+        let result = client.try_accept_admin();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_non_admin_cannot_propose_transfer() {
+        let env = Env::default();
+        // Do NOT use mock_all_auths — we want real auth verification.
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, ComplianceRegistry);
+        let client = ComplianceRegistryClient::new(&env, &contract_id);
+
+        // Initialize using a targeted mock so only the admin auth is approved.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "initialize",
+                args: soroban_sdk::vec![&env, admin.to_val()].into(),
+                sub_invokes: &[],
+            },
+        }]);
+        client.initialize(&admin);
+
+        // With no auth mocked, propose_admin should fail because
+        // admin.require_auth() will not be satisfied.
+        let result = client.try_propose_admin(&new_admin);
         assert!(result.is_err());
     }
 }
