@@ -51,6 +51,12 @@ pub enum DataKey {
     Quorum,
 }
 
+/// Bump instance TTL to ~60 days (in ledgers at 5s/ledger) whenever the current
+/// TTL falls below ~30 days. Called on every public entry point so active
+/// contracts never silently expire their on-chain state.
+const INSTANCE_TTL_THRESHOLD: u32 = 518_400;  // 30 days in ledgers
+const INSTANCE_TTL_EXTEND_TO: u32 = 1_036_800; // 60 days in ledgers
+
 #[contract]
 pub struct Governance;
 
@@ -62,6 +68,7 @@ impl Governance {
         admin: Address,
         fraction_vault: Address,
     ) -> Result<(), GovernanceError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let existing: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         if existing.is_some() {
             return Err(GovernanceError::AlreadyInitialized);
@@ -82,6 +89,7 @@ impl Governance {
 
     /// Updates the quorum required for proposals to pass. Admin-only.
     pub fn set_quorum(env: Env, quorum: u128) -> Result<(), GovernanceError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -94,6 +102,7 @@ impl Governance {
 
     /// Adds a property to the tracked set for voting power computation. Admin-only.
     pub fn add_tracked_property(env: Env, prop_id: u64) -> Result<(), GovernanceError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -131,6 +140,7 @@ impl Governance {
         calldata: Bytes,
         description: String,
     ) -> Result<u64, GovernanceError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         proposer.require_auth();
 
         // Only fraction holders may create proposals
@@ -184,6 +194,7 @@ impl Governance {
         proposal_id: u64,
         support: bool,
     ) -> Result<(), GovernanceError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         voter.require_auth();
 
         let mut proposal: ProposalData = env
@@ -233,6 +244,7 @@ impl Governance {
 
     /// Executes a passed proposal after voting and timelock periods have elapsed.
     pub fn execute(env: Env, proposal_id: u64) -> Result<(), GovernanceError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let mut proposal: ProposalData = env
             .storage()
             .instance()
@@ -275,6 +287,7 @@ impl Governance {
 
     /// Returns the total voting power of a user based on their fraction holdings.
     pub fn voting_power(env: Env, user: Address) -> u128 {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         Governance::voting_power_internal(&env, user)
     }
 
@@ -305,6 +318,7 @@ impl Governance {
 
     /// Returns the ProposalData for a given proposal ID.
     pub fn get_proposal(env: Env, proposal_id: u64) -> Result<ProposalData, GovernanceError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::Proposal(proposal_id))

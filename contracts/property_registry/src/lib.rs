@@ -32,6 +32,12 @@ pub enum DataKey {
     PendingAdmin,
 }
 
+/// Bump instance TTL to ~60 days (in ledgers at 5s/ledger) whenever the current
+/// TTL falls below ~30 days. Called on every public entry point so active
+/// contracts never silently expire their on-chain state.
+const INSTANCE_TTL_THRESHOLD: u32 = 518_400;  // 30 days in ledgers
+const INSTANCE_TTL_EXTEND_TO: u32 = 1_036_800; // 60 days in ledgers
+
 #[contract]
 pub struct PropertyRegistry;
 
@@ -39,6 +45,7 @@ pub struct PropertyRegistry;
 impl PropertyRegistry {
     /// Sets the admin address. Called once at deployment.
     pub fn initialize(env: Env, admin: Address) -> Result<(), PropertyRegistryError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let existing: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         if existing.is_some() {
             return Err(PropertyRegistryError::AlreadyInitialized);
@@ -55,6 +62,7 @@ impl PropertyRegistry {
         doc_hash: BytesN<32>,
         jurisdiction: Symbol,
     ) -> Result<u64, PropertyRegistryError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -109,6 +117,7 @@ impl PropertyRegistry {
         oracle_contract: Address,
         asset: Symbol,
     ) -> Result<(), PropertyRegistryError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let mut property: PropertyData = env
             .storage()
             .instance()
@@ -180,6 +189,7 @@ impl PropertyRegistry {
         to: Address,
         compliance_contract: Address,
     ) -> Result<(), PropertyRegistryError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let mut property: PropertyData = env
             .storage()
             .instance()
@@ -220,6 +230,7 @@ impl PropertyRegistry {
 
     /// Returns the PropertyData for the given property ID.
     pub fn get_property(env: Env, prop_id: u64) -> Result<PropertyData, PropertyRegistryError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::Property(prop_id))
@@ -232,6 +243,7 @@ impl PropertyRegistry {
         prop_id: u64,
         status: PropertyStatus,
     ) -> Result<(), PropertyRegistryError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -258,6 +270,7 @@ impl PropertyRegistry {
         env: Env,
         prop_id: u64,
     ) -> Result<Symbol, PropertyRegistryError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::Jurisdiction(prop_id))
@@ -270,6 +283,7 @@ impl PropertyRegistry {
         env: Env,
         new_admin: Address,
     ) -> Result<(), PropertyRegistryError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -288,6 +302,7 @@ impl PropertyRegistry {
 
     /// Completes the two-step admin transfer. The pending admin must call this.
     pub fn accept_admin(env: Env) -> Result<(), PropertyRegistryError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let pending: Address = env
             .storage()
             .instance()

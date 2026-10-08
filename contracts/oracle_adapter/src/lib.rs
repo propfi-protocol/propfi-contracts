@@ -46,6 +46,12 @@ pub enum DataKey {
     PriceSamples(Symbol),
 }
 
+/// Bump instance TTL to ~60 days (in ledgers at 5s/ledger) whenever the current
+/// TTL falls below ~30 days. Called on every public entry point so active
+/// contracts never silently expire their on-chain state.
+const INSTANCE_TTL_THRESHOLD: u32 = 518_400;  // 30 days in ledgers
+const INSTANCE_TTL_EXTEND_TO: u32 = 1_036_800; // 60 days in ledgers
+
 #[contract]
 pub struct OracleAdapter;
 
@@ -57,6 +63,7 @@ impl OracleAdapter {
         admin: Address,
         staleness_threshold: u64,
     ) -> Result<(), OracleAdapterError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let existing: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         if existing.is_some() {
             return Err(OracleAdapterError::AlreadyInitialized);
@@ -74,6 +81,7 @@ impl OracleAdapter {
         oracle_addr: Address,
         weight: u32,
     ) -> Result<(), OracleAdapterError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -96,6 +104,7 @@ impl OracleAdapter {
 
     /// Removes an oracle from the registry. Only callable by admin.
     pub fn remove_oracle(env: Env, oracle_addr: Address) -> Result<(), OracleAdapterError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -125,6 +134,7 @@ impl OracleAdapter {
         oracle_addr: Address,
         new_weight: u32,
     ) -> Result<(), OracleAdapterError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -158,6 +168,7 @@ impl OracleAdapter {
         asset: Symbol,
         price: i128,
     ) -> Result<(), OracleAdapterError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         oracle.require_auth();
 
         let info: OracleInfo = env
@@ -258,6 +269,7 @@ impl OracleAdapter {
     /// Emits a StaleAlert event when the price exceeds the staleness threshold but still returns it.
     /// Use get_price_strict() when stale prices must be rejected.
     pub fn get_price(env: Env, asset: Symbol) -> PriceData {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let price_data: PriceData = env
             .storage()
             .instance()
@@ -296,6 +308,7 @@ impl OracleAdapter {
         env: Env,
         asset: Symbol,
     ) -> Result<PriceData, OracleAdapterError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let price_data: PriceData = env
             .storage()
             .instance()
@@ -322,6 +335,7 @@ impl OracleAdapter {
 
     /// Computes the time-weighted average price over the given window (in seconds).
     pub fn twap(env: Env, asset: Symbol, window_secs: u64) -> i128 {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let samples: Vec<PriceSample> = env
             .storage()
             .instance()
@@ -365,6 +379,7 @@ impl OracleAdapter {
 
     /// Returns the registration info for a given oracle address.
     pub fn get_oracle_info(env: Env, oracle_addr: Address) -> OracleInfo {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::OracleInfo(oracle_addr))
@@ -376,6 +391,7 @@ impl OracleAdapter {
 
     /// Returns the configured staleness threshold in seconds.
     pub fn get_staleness_threshold(env: Env) -> u64 {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::StalenessThreshold)
