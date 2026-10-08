@@ -6,11 +6,20 @@
 
 #![no_std]
 use propfi_types::JurisdictionRules;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, Symbol};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Bytes, Env, Symbol};
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum ComplianceRegistryError {
+    AlreadyInitialized = 1,
+    Unauthorized = 2,
+    AttestationNotFound = 3,
+    UserNotCompliant = 4,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
-/// A KYC attestation record for a user.
+/// A KYC attestation record for a user under a specific jurisdiction.
 pub struct Attestation {
     /// Hash of the ZK proof (never raw PII stored on-chain)
     pub proof_hash: Bytes,
@@ -25,7 +34,8 @@ pub struct Attestation {
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
-    Attestation(Address),
+    /// One attestation record per (user, jurisdiction) pair.
+    Attestation(Address, Symbol),
     JurisdictionRules(Symbol),
     Admin,
 }
@@ -38,12 +48,13 @@ pub struct ComplianceRegistry;
 #[contractimpl]
 impl ComplianceRegistry {
     /// Sets the admin address. Called once at deployment.
-    pub fn initialize(env: Env, admin: Address) {
+    pub fn initialize(env: Env, admin: Address) -> Result<(), ComplianceRegistryError> {
         let existing: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         if existing.is_some() {
-            panic!("already initialized");
+            return Err(ComplianceRegistryError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        Ok(())
     }
 
     /// Records a KYC attestation for `user` under the given `jurisdiction`.
@@ -54,8 +65,12 @@ impl ComplianceRegistry {
         proof_hash: Bytes,
         jurisdiction: Symbol,
         duration_days: u32,
-    ) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    ) -> Result<(), ComplianceRegistryError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(ComplianceRegistryError::Unauthorized)?;
         admin.require_auth();
 
         let expiry = env
@@ -73,18 +88,20 @@ impl ComplianceRegistry {
 
         env.storage()
             .instance()
-            .set(&DataKey::Attestation(user.clone()), &attestation);
+            .set(&DataKey::Attestation(user.clone(), jurisdiction.clone()), &attestation);
 
         env.events().publish(
             (Symbol::new(&env, "Attested"), user),
             (jurisdiction, expiry),
         );
+
+        Ok(())
     }
 
     /// Checks whether `user` has a valid, non-expired attestation for `jurisdiction`.
     /// Also enforces min-remaining-days rules if configured.
     pub fn is_compliant(env: Env, user: Address, jurisdiction: Symbol) -> bool {
-        let key = DataKey::Attestation(user);
+        let key = DataKey::Attestation(user, jurisdiction.clone());
         let attestation = match env.storage().instance().get::<DataKey, Attestation>(&key) {
             Some(a) => a,
             None => return false,
@@ -95,10 +112,6 @@ impl ComplianceRegistry {
         }
 
         if attestation.expiry <= env.ledger().timestamp() {
-            return false;
-        }
-
-        if attestation.jurisdiction != jurisdiction {
             return false;
         }
 
@@ -117,26 +130,43 @@ impl ComplianceRegistry {
         true
     }
 
-    /// Revokes a user's attestation. Only callable by the admin.
-    /// Emits a `Revoked` event. All compliance checks will fail for this user.
-    pub fn revoke(env: Env, user: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    /// Revokes a user's attestation for a specific jurisdiction. Only callable by the admin.
+    /// Emits a `Revoked` event. All compliance checks will fail for this user and jurisdiction.
+    pub fn revoke(env: Env, user: Address, jurisdiction: Symbol) -> Result<(), ComplianceRegistryError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(ComplianceRegistryError::Unauthorized)?;
         admin.require_auth();
 
-        let key = DataKey::Attestation(user.clone());
-        let mut attestation: Attestation = env.storage().instance().get(&key).unwrap();
+        let key = DataKey::Attestation(user.clone(), jurisdiction.clone());
+        let mut attestation: Attestation = env
+            .storage()
+            .instance()
+            .get(&key)
+            .ok_or(ComplianceRegistryError::AttestationNotFound)?;
         attestation.active = false;
 
         env.storage().instance().set(&key, &attestation);
 
         env.events()
-            .publish((Symbol::new(&env, "Revoked"), user), ());
+            .publish((Symbol::new(&env, "Revoked"), user), jurisdiction);
+        Ok(())
     }
 
     /// Configures compliance rules for a jurisdiction (e.g., min attestation duration).
     /// Only callable by the admin. Emits a `RulesUpdated` event.
-    pub fn set_jurisdiction_rules(env: Env, jurisdiction: Symbol, rules: JurisdictionRules) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    pub fn set_jurisdiction_rules(
+        env: Env,
+        jurisdiction: Symbol,
+        rules: JurisdictionRules,
+    ) -> Result<(), ComplianceRegistryError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(ComplianceRegistryError::Unauthorized)?;
         admin.require_auth();
 
         env.storage()
@@ -145,16 +175,24 @@ impl ComplianceRegistry {
 
         env.events()
             .publish((Symbol::new(&env, "RulesUpdated"), jurisdiction), ());
+        Ok(())
     }
 
-    /// Returns the ledger timestamp at which the user's attestation expires.
-    /// Returns 0 if the user has no attestation.
-    pub fn attestation_expiry(env: Env, user: Address) -> u64 {
-        let key = DataKey::Attestation(user);
+    /// Returns the ledger timestamp at which the user's attestation for the given jurisdiction expires.
+    /// Returns 0 if the user has no attestation for that jurisdiction.
+    pub fn attestation_expiry(env: Env, user: Address, jurisdiction: Symbol) -> u64 {
+        let key = DataKey::Attestation(user, jurisdiction);
         match env.storage().instance().get::<DataKey, Attestation>(&key) {
             Some(a) => a.expiry,
             None => 0,
         }
+    }
+
+    /// Returns the full Attestation record for a user and jurisdiction, if it exists.
+    pub fn get_attestation(env: Env, user: Address, jurisdiction: Symbol) -> Option<Attestation> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Attestation(user, jurisdiction))
     }
 }
 
@@ -191,7 +229,7 @@ mod test {
 
         assert!(client.is_compliant(&user, &jurisdiction));
 
-        let expiry = client.attestation_expiry(&user);
+        let expiry = client.attestation_expiry(&user, &jurisdiction);
         assert!(expiry > 0);
         assert_eq!(expiry, env.ledger().timestamp() + 365 * DAY);
     }
@@ -223,10 +261,10 @@ mod test {
         client.attest(&user, &proof, &jurisdiction, &365u32);
         assert!(client.is_compliant(&user, &jurisdiction));
 
-        client.revoke(&user);
+        client.revoke(&user, &jurisdiction);
         assert!(!client.is_compliant(&user, &jurisdiction));
 
-        let expiry = client.attestation_expiry(&user);
+        let expiry = client.attestation_expiry(&user, &jurisdiction);
         assert!(expiry > 0);
     }
 
@@ -289,27 +327,70 @@ mod test {
         let jurisdiction = Symbol::new(&env, "US");
         assert!(!client.is_compliant(&user, &jurisdiction));
 
-        let expiry = client.attestation_expiry(&user);
+        let expiry = client.attestation_expiry(&user, &jurisdiction);
         assert_eq!(expiry, 0);
     }
 
     #[test]
-    fn test_multiple_jurisdictions() {
+    fn test_multiple_jurisdictions_per_user() {
         let (env, _admin, user, client) = setup();
 
         let us = Symbol::new(&env, "US");
         let eu = Symbol::new(&env, "EU");
 
-        let proof = Bytes::from_slice(&env, b"proof_us");
+        let proof_us = Bytes::from_slice(&env, b"proof_us");
+        let proof_eu = Bytes::from_slice(&env, b"proof_eu");
+
+        client.attest(&user, &proof_us, &us, &365u32);
+        client.attest(&user, &proof_eu, &eu, &180u32);
+
+        // User is now simultaneously compliant in both jurisdictions
+        assert!(client.is_compliant(&user, &us));
+        assert!(client.is_compliant(&user, &eu));
+    }
+
+    #[test]
+    fn test_revoke_one_jurisdiction_preserves_other() {
+        let (env, _admin, user, client) = setup();
+
+        let us = Symbol::new(&env, "US");
+        let eu = Symbol::new(&env, "EU");
+
+        let proof_us = Bytes::from_slice(&env, b"proof_us");
+        let proof_eu = Bytes::from_slice(&env, b"proof_eu");
+
+        client.attest(&user, &proof_us, &us, &365u32);
+        client.attest(&user, &proof_eu, &eu, &180u32);
+
+        // Revoke US only
+        client.revoke(&user, &us);
+
+        assert!(!client.is_compliant(&user, &us));
+        // EU attestation still active
+        assert!(client.is_compliant(&user, &eu));
+    }
+
+    #[test]
+    fn test_get_attestation() {
+        let (env, _admin, user, client) = setup();
+
+        let us = Symbol::new(&env, "US");
+        let proof = Bytes::from_slice(&env, b"proof_data");
+
+        assert!(client.get_attestation(&user, &us).is_none());
+
         client.attest(&user, &proof, &us, &365u32);
 
-        assert!(client.is_compliant(&user, &us));
-        assert!(!client.is_compliant(&user, &eu));
+        let att = client.get_attestation(&user, &us).unwrap();
+        assert!(att.active);
+        assert_eq!(att.jurisdiction, us);
+    }
 
-        let proof2 = Bytes::from_slice(&env, b"proof_eu");
-        client.attest(&user, &proof2, &eu, &180u32);
-
-        assert!(client.is_compliant(&user, &eu));
-        assert!(!client.is_compliant(&user, &us));
+    #[test]
+    fn test_double_initialize_returns_error() {
+        let (env, _admin, _user, client) = setup();
+        let rogue_admin = Address::generate(&env);
+        let result = client.try_initialize(&rogue_admin);
+        assert!(result.is_err());
     }
 }

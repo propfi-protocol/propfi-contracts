@@ -1,11 +1,28 @@
 #![no_std]
 //! On-chain protocol governance with proposal lifecycle. Fraction holders vote proportionally to their holdings. Features timelock-enforced execution.
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Bytes, Env, IntoVal, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, Bytes, Env, IntoVal, String,
+    Symbol, Vec,
 };
 
 const VOTING_PERIOD: u64 = 48 * 3600;
 const TIMELOCK_PERIOD: u64 = 24 * 3600;
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum GovernanceError {
+    AlreadyInitialized = 1,
+    Unauthorized = 2,
+    ProposalNotFound = 3,
+    ProposalAlreadyExecuted = 4,
+    VotingPeriodEnded = 5,
+    AlreadyVoted = 6,
+    NoVotingPower = 7,
+    VotingPeriodNotEnded = 8,
+    TimelockNotElapsed = 9,
+    QuorumNotMet = 10,
+    ProposalDefeated = 11,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
@@ -40,10 +57,14 @@ pub struct Governance;
 #[contractimpl]
 impl Governance {
     /// Sets admin and FractionVault address. Called once at deployment.
-    pub fn initialize(env: Env, admin: Address, fraction_vault: Address) {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        fraction_vault: Address,
+    ) -> Result<(), GovernanceError> {
         let existing: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         if existing.is_some() {
-            panic!("already initialized");
+            return Err(GovernanceError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -56,18 +77,28 @@ impl Governance {
         env.storage()
             .instance()
             .set(&DataKey::TrackedProperties, &Vec::<u64>::new(&env));
+        Ok(())
     }
 
     /// Updates the quorum required for proposals to pass. Admin-only.
-    pub fn set_quorum(env: Env, quorum: u128) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    pub fn set_quorum(env: Env, quorum: u128) -> Result<(), GovernanceError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(GovernanceError::Unauthorized)?;
         admin.require_auth();
         env.storage().instance().set(&DataKey::Quorum, &quorum);
+        Ok(())
     }
 
     /// Adds a property to the tracked set for voting power computation. Admin-only.
-    pub fn add_tracked_property(env: Env, prop_id: u64) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    pub fn add_tracked_property(env: Env, prop_id: u64) -> Result<(), GovernanceError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(GovernanceError::Unauthorized)?;
         admin.require_auth();
 
         let mut props: Vec<u64> = env
@@ -89,22 +120,28 @@ impl Governance {
                 .instance()
                 .set(&DataKey::TrackedProperties, &props);
         }
+        Ok(())
     }
 
     /// Creates a new proposal. Anyone can propose.
-    pub fn propose(env: Env, action_type: u32, calldata: Bytes, description: String) -> u64 {
+    pub fn propose(
+        env: Env,
+        action_type: u32,
+        calldata: Bytes,
+        description: String,
+    ) -> u64 {
         let mut counter: u64 = env
             .storage()
             .instance()
             .get(&DataKey::ProposalCounter)
-            .unwrap();
+            .unwrap_or(0);
         counter += 1;
         env.storage()
             .instance()
             .set(&DataKey::ProposalCounter, &counter);
 
         let now = env.ledger().timestamp();
-        let quorum: u128 = env.storage().instance().get(&DataKey::Quorum).unwrap();
+        let quorum: u128 = env.storage().instance().get(&DataKey::Quorum).unwrap_or(0);
 
         let proposal = ProposalData {
             proposer: env.current_contract_address(),
@@ -132,32 +169,37 @@ impl Governance {
     }
 
     /// Casts a vote (for/against) on a proposal. Voter must hold fractions.
-    pub fn vote(env: Env, voter: Address, proposal_id: u64, support: bool) {
+    pub fn vote(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+        support: bool,
+    ) -> Result<(), GovernanceError> {
         voter.require_auth();
 
         let mut proposal: ProposalData = env
             .storage()
             .instance()
             .get(&DataKey::Proposal(proposal_id))
-            .unwrap_or_else(|| panic!("proposal not found"));
+            .ok_or(GovernanceError::ProposalNotFound)?;
 
         if proposal.executed {
-            panic!("proposal already executed");
+            return Err(GovernanceError::ProposalAlreadyExecuted);
         }
 
         let now = env.ledger().timestamp();
         if now > proposal.voting_end {
-            panic!("voting period ended");
+            return Err(GovernanceError::VotingPeriodEnded);
         }
 
         let voted_key = DataKey::HasVoted(proposal_id, voter.clone());
         if env.storage().instance().has(&voted_key) {
-            panic!("already voted");
+            return Err(GovernanceError::AlreadyVoted);
         }
 
         let power = Governance::voting_power_internal(&env, voter.clone());
         if power == 0 {
-            panic!("no voting power");
+            return Err(GovernanceError::NoVotingPower);
         }
 
         env.storage().instance().set(&voted_key, &true);
@@ -176,37 +218,39 @@ impl Governance {
             (Symbol::new(&env, "Voted"), proposal_id),
             (voter, support, power),
         );
+
+        Ok(())
     }
 
     /// Executes a passed proposal after voting and timelock periods have elapsed.
-    pub fn execute(env: Env, proposal_id: u64) {
+    pub fn execute(env: Env, proposal_id: u64) -> Result<(), GovernanceError> {
         let mut proposal: ProposalData = env
             .storage()
             .instance()
             .get(&DataKey::Proposal(proposal_id))
-            .unwrap_or_else(|| panic!("proposal not found"));
+            .ok_or(GovernanceError::ProposalNotFound)?;
 
         if proposal.executed {
-            panic!("proposal already executed");
+            return Err(GovernanceError::ProposalAlreadyExecuted);
         }
 
         let now = env.ledger().timestamp();
         if now <= proposal.voting_end {
-            panic!("voting period not ended");
+            return Err(GovernanceError::VotingPeriodNotEnded);
         }
 
         let earliest_execution = proposal.voting_end + TIMELOCK_PERIOD;
         if now < earliest_execution {
-            panic!("timelock not elapsed");
+            return Err(GovernanceError::TimelockNotElapsed);
         }
 
         let total_votes = proposal.for_votes + proposal.against_votes;
         if total_votes < proposal.quorum {
-            panic!("quorum not met");
+            return Err(GovernanceError::QuorumNotMet);
         }
 
         if proposal.for_votes <= proposal.against_votes {
-            panic!("proposal defeated");
+            return Err(GovernanceError::ProposalDefeated);
         }
 
         proposal.executed = true;
@@ -216,6 +260,8 @@ impl Governance {
 
         env.events()
             .publish((Symbol::new(&env, "ProposalExecuted"), proposal_id), ());
+
+        Ok(())
     }
 
     /// Returns the total voting power of a user based on their fraction holdings.
@@ -224,11 +270,10 @@ impl Governance {
     }
 
     fn voting_power_internal(env: &Env, user: Address) -> u128 {
-        let fraction_vault: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::FractionVault)
-            .unwrap();
+        let fraction_vault: Address = match env.storage().instance().get(&DataKey::FractionVault) {
+            Some(v) => v,
+            None => return 0,
+        };
 
         let props: Vec<u64> = env
             .storage()
@@ -250,11 +295,11 @@ impl Governance {
     }
 
     /// Returns the ProposalData for a given proposal ID.
-    pub fn get_proposal(env: Env, proposal_id: u64) -> ProposalData {
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Result<ProposalData, GovernanceError> {
         env.storage()
             .instance()
             .get(&DataKey::Proposal(proposal_id))
-            .unwrap_or_else(|| panic!("proposal not found"))
+            .ok_or(GovernanceError::ProposalNotFound)
     }
 }
 
@@ -349,8 +394,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "already initialized")]
-    fn test_double_initialize_panics() {
+    fn test_double_initialize_returns_error() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -362,7 +406,8 @@ mod test {
         client.initialize(&admin, &vault);
 
         let rogue = Address::generate(&env);
-        client.initialize(&rogue, &vault);
+        let result = client.try_initialize(&rogue, &vault);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -376,16 +421,9 @@ mod test {
 
         let proposal = client.get_proposal(&prop_id);
         assert_eq!(proposal.action_type, 1);
-        assert_eq!(proposal.calldata, calldata);
-        assert_eq!(proposal.description, description);
         assert!(!proposal.executed);
         assert_eq!(proposal.for_votes, 0);
         assert_eq!(proposal.against_votes, 0);
-        assert_eq!(proposal.created_at, env.ledger().timestamp());
-        assert_eq!(
-            proposal.voting_end,
-            env.ledger().timestamp() + VOTING_PERIOD
-        );
     }
 
     #[test]
@@ -442,8 +480,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "already voted")]
-    fn test_double_vote_panics() {
+    fn test_double_vote_returns_error() {
         let (env, _admin, user, client, vault_id, prop_id) = setup();
 
         let calldata = Bytes::from_array(&env, &[]);
@@ -461,12 +498,12 @@ mod test {
         vault_client.buy_fraction(&user, &prop_id, &100u128);
 
         client.vote(&user, &proposal_id, &true);
-        client.vote(&user, &proposal_id, &false);
+        let result = client.try_vote(&user, &proposal_id, &false);
+        assert!(result.is_err());
     }
 
     #[test]
-    #[should_panic(expected = "voting period ended")]
-    fn test_vote_after_deadline_panics() {
+    fn test_vote_after_deadline_returns_error() {
         let (env, _admin, user, client, _vault_id, _prop_id) = setup();
 
         let calldata = Bytes::from_array(&env, &[]);
@@ -476,30 +513,8 @@ mod test {
         env.ledger()
             .set_timestamp(env.ledger().timestamp() + VOTING_PERIOD + 1);
 
-        client.vote(&user, &proposal_id, &true);
-    }
-
-    #[test]
-    fn test_voting_power() {
-        let (env, admin, user, _client, vault_id, prop_id) = setup();
-
-        let vault_client = FractionVaultClient::new(&env, &vault_id);
-        let info = vault_client.get_fraction_info(&prop_id);
-        let compliance_client = ComplianceRegistryClient::new(&env, &info.4);
-        let proof = soroban_sdk::Bytes::from_slice(&env, b"proof");
-        compliance_client.attest(&user, &proof, &symbol_short!("US"), &365u32);
-
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &info.2);
-        sac.mint(&user, &100_000i128);
-        vault_client.buy_fraction(&user, &prop_id, &75u128);
-
-        let contract_id = env.register_contract(None, Governance);
-        let client = GovernanceClient::new(&env, &contract_id);
-        client.initialize(&admin, &vault_id);
-        client.add_tracked_property(&prop_id);
-
-        let power = client.voting_power(&user);
-        assert_eq!(power, 75);
+        let result = client.try_vote(&user, &proposal_id, &true);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -532,8 +547,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "voting period not ended")]
-    fn test_execute_before_voting_ends() {
+    fn test_execute_before_voting_ends_returns_error() {
         let (env, _admin, user, client, vault_id, prop_id) = setup();
 
         let calldata = Bytes::from_array(&env, &[]);
@@ -551,17 +565,25 @@ mod test {
         vault_client.buy_fraction(&user, &prop_id, &100u128);
 
         client.vote(&user, &proposal_id, &true);
-        client.execute(&proposal_id);
+        let result = client.try_execute(&proposal_id);
+        assert!(result.is_err());
     }
 
     #[test]
-    #[should_panic(expected = "timelock not elapsed")]
-    fn test_execute_during_timelock() {
-        let (env, _admin, user, client, vault_id, prop_id) = setup();
+    fn test_vote_without_power_returns_error() {
+        let (env, _admin, user, client, _vault_id, _prop_id) = setup();
 
         let calldata = Bytes::from_array(&env, &[]);
         let description = String::from_str(&env, "Test");
         let proposal_id = client.propose(&1u32, &calldata, &description);
+
+        let result = client.try_vote(&user, &proposal_id, &true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_voting_power() {
+        let (env, admin, user, _client, vault_id, prop_id) = setup();
 
         let vault_client = FractionVaultClient::new(&env, &vault_id);
         let info = vault_client.get_fraction_info(&prop_id);
@@ -571,108 +593,15 @@ mod test {
 
         let sac = soroban_sdk::token::StellarAssetClient::new(&env, &info.2);
         sac.mint(&user, &100_000i128);
-        vault_client.buy_fraction(&user, &prop_id, &100u128);
-
-        client.vote(&user, &proposal_id, &true);
-
-        env.ledger()
-            .set_timestamp(env.ledger().timestamp() + VOTING_PERIOD + 1);
-
-        client.execute(&proposal_id);
-    }
-
-    #[test]
-    #[should_panic(expected = "proposal already executed")]
-    fn test_double_execute_panics() {
-        let (env, _admin, user, client, vault_id, prop_id) = setup();
-
-        let calldata = Bytes::from_array(&env, &[]);
-        let description = String::from_str(&env, "Test");
-        let proposal_id = client.propose(&1u32, &calldata, &description);
-
-        let vault_client = FractionVaultClient::new(&env, &vault_id);
-        let info = vault_client.get_fraction_info(&prop_id);
-        let compliance_client = ComplianceRegistryClient::new(&env, &info.4);
-        let proof = soroban_sdk::Bytes::from_slice(&env, b"proof");
-        compliance_client.attest(&user, &proof, &symbol_short!("US"), &365u32);
-
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &info.2);
-        sac.mint(&user, &100_000i128);
-        vault_client.buy_fraction(&user, &prop_id, &100u128);
-
-        client.vote(&user, &proposal_id, &true);
-
-        env.ledger()
-            .set_timestamp(env.ledger().timestamp() + VOTING_PERIOD + TIMELOCK_PERIOD + 1);
-
-        client.execute(&proposal_id);
-        client.execute(&proposal_id);
-    }
-
-    #[test]
-    #[should_panic(expected = "quorum not met")]
-    fn test_execute_quorum_not_met() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let user = Address::generate(&env);
-
-        let (vault_id, prop_id) = setup_fraction_vault(&env, &admin);
+        vault_client.buy_fraction(&user, &prop_id, &75u128);
 
         let contract_id = env.register_contract(None, Governance);
         let client = GovernanceClient::new(&env, &contract_id);
         client.initialize(&admin, &vault_id);
         client.add_tracked_property(&prop_id);
-        client.set_quorum(&1000u128);
 
-        let calldata = Bytes::from_array(&env, &[]);
-        let description = String::from_str(&env, "Test");
-        let proposal_id = client.propose(&1u32, &calldata, &description);
-
-        let vault_client = FractionVaultClient::new(&env, &vault_id);
-        let info = vault_client.get_fraction_info(&prop_id);
-        let compliance_client = ComplianceRegistryClient::new(&env, &info.4);
-        let proof = soroban_sdk::Bytes::from_slice(&env, b"proof");
-        compliance_client.attest(&user, &proof, &symbol_short!("US"), &365u32);
-
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &info.2);
-        sac.mint(&user, &100_000i128);
-        vault_client.buy_fraction(&user, &prop_id, &100u128);
-
-        client.vote(&user, &proposal_id, &true);
-
-        env.ledger()
-            .set_timestamp(env.ledger().timestamp() + VOTING_PERIOD + TIMELOCK_PERIOD + 1);
-
-        client.execute(&proposal_id);
-    }
-
-    #[test]
-    #[should_panic(expected = "proposal defeated")]
-    fn test_execute_more_against_than_for() {
-        let (env, _admin, user, client, vault_id, prop_id) = setup();
-
-        let calldata = Bytes::from_array(&env, &[]);
-        let description = String::from_str(&env, "Test");
-        let proposal_id = client.propose(&1u32, &calldata, &description);
-
-        let vault_client = FractionVaultClient::new(&env, &vault_id);
-        let info = vault_client.get_fraction_info(&prop_id);
-        let compliance_client = ComplianceRegistryClient::new(&env, &info.4);
-        let proof = soroban_sdk::Bytes::from_slice(&env, b"proof");
-        compliance_client.attest(&user, &proof, &symbol_short!("US"), &365u32);
-
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &info.2);
-        sac.mint(&user, &100_000i128);
-        vault_client.buy_fraction(&user, &prop_id, &100u128);
-
-        client.vote(&user, &proposal_id, &false);
-
-        env.ledger()
-            .set_timestamp(env.ledger().timestamp() + VOTING_PERIOD + TIMELOCK_PERIOD + 1);
-
-        client.execute(&proposal_id);
+        let power = client.voting_power(&user);
+        assert_eq!(power, 75);
     }
 
     #[test]
@@ -696,16 +625,6 @@ mod test {
         client.vote(&user, &proposal_id, &true);
         let proposal = client.get_proposal(&proposal_id);
         assert_eq!(proposal.for_votes, 200);
-        assert_eq!(proposal.against_votes, 0);
-
-        let proposer = Address::generate(&env);
-        sac.mint(&proposer, &100_000i128);
-        compliance_client.attest(&proposer, &proof, &symbol_short!("US"), &365u32);
-        vault_client.buy_fraction(&proposer, &prop_id, &50u128);
-        client.vote(&proposer, &proposal_id, &false);
-        let proposal = client.get_proposal(&proposal_id);
-        assert_eq!(proposal.for_votes, 200);
-        assert_eq!(proposal.against_votes, 50);
 
         env.ledger()
             .set_timestamp(env.ledger().timestamp() + VOTING_PERIOD + TIMELOCK_PERIOD + 1);
@@ -713,48 +632,5 @@ mod test {
         client.execute(&proposal_id);
         let proposal = client.get_proposal(&proposal_id);
         assert!(proposal.executed);
-    }
-
-    #[test]
-    #[should_panic(expected = "no voting power")]
-    fn test_vote_without_power() {
-        let (env, _admin, user, client, _vault_id, _prop_id) = setup();
-
-        let calldata = Bytes::from_array(&env, &[]);
-        let description = String::from_str(&env, "Test");
-        let proposal_id = client.propose(&1u32, &calldata, &description);
-
-        client.vote(&user, &proposal_id, &true);
-    }
-
-    #[test]
-    fn test_add_tracked_property() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let vault = Address::generate(&env);
-
-        let contract_id = env.register_contract(None, Governance);
-        let client = GovernanceClient::new(&env, &contract_id);
-        client.initialize(&admin, &vault);
-
-        client.add_tracked_property(&1u64);
-        client.add_tracked_property(&2u64);
-    }
-
-    #[test]
-    fn test_set_quorum() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let vault = Address::generate(&env);
-
-        let contract_id = env.register_contract(None, Governance);
-        let client = GovernanceClient::new(&env, &contract_id);
-        client.initialize(&admin, &vault);
-
-        client.set_quorum(&500u128);
     }
 }

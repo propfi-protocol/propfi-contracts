@@ -1,7 +1,22 @@
 #![no_std]
 //! Permissionless on-chain lending against tokenized property equity. LTV-gated with automated liquidation at 80% threshold.
 use propfi_types::{HealthFactor, LoanData, LoanStatus, PropertyData};
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Vec};
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum MortgagePoolError {
+    AlreadyInitialized = 1,
+    Unauthorized = 2,
+    LoanNotFound = 3,
+    LoanNotActive = 4,
+    OnlyPropertyOwner = 5,
+    LoanExceedsMaxLtv = 6,
+    InsufficientPoolLiquidity = 7,
+    InsufficientLpBalance = 8,
+    LoanIsHealthy = 9,
+    ContractPaused = 10,
+}
 
 #[derive(Clone)]
 #[contracttype]
@@ -14,6 +29,7 @@ pub enum DataKey {
     LiquidityToken,
     PropertyRegistry,
     OracleAdapter,
+    Paused,
 }
 
 const MAX_LTV_BPS: u32 = 7000; // 70%
@@ -33,10 +49,10 @@ impl MortgagePool {
         token: Address,
         property_reg: Address,
         oracle: Address,
-    ) {
+    ) -> Result<(), MortgagePoolError> {
         let existing: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         if existing.is_some() {
-            panic!("already initialized");
+            return Err(MortgagePoolError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -52,17 +68,63 @@ impl MortgagePool {
         env.storage()
             .instance()
             .set(&DataKey::TotalLiquidity, &0i128);
+        env.storage().instance().set(&DataKey::Paused, &false);
+        Ok(())
+    }
+
+    /// Pauses the contract. Admin-only. Blocks open_loan and deposit_liquidity.
+    pub fn pause(env: Env) -> Result<(), MortgagePoolError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(MortgagePoolError::Unauthorized)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events()
+            .publish((Symbol::new(&env, "Paused"),), env.ledger().timestamp());
+        Ok(())
+    }
+
+    /// Unpauses the contract. Admin-only.
+    pub fn unpause(env: Env) -> Result<(), MortgagePoolError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(MortgagePoolError::Unauthorized)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events()
+            .publish((Symbol::new(&env, "Unpaused"),), env.ledger().timestamp());
+        Ok(())
+    }
+
+    /// Returns whether the contract is paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     /// Opens a new loan against a property. Borrower must authorize. Enforces max 70% LTV.
-    pub fn open_loan(env: Env, borrower: Address, prop_id: u64, amount: i128) -> u64 {
+    pub fn open_loan(
+        env: Env,
+        borrower: Address,
+        prop_id: u64,
+        amount: i128,
+    ) -> Result<u64, MortgagePoolError> {
+        if Self::is_paused(env.clone()) {
+            return Err(MortgagePoolError::ContractPaused);
+        }
         borrower.require_auth();
 
         let property_reg: Address = env
             .storage()
             .instance()
             .get(&DataKey::PropertyRegistry)
-            .unwrap();
+            .ok_or(MortgagePoolError::Unauthorized)?;
         let property: PropertyData = env.invoke_contract(
             &property_reg,
             &Symbol::new(&env, "get_property"),
@@ -70,13 +132,13 @@ impl MortgagePool {
         );
 
         if property.owner != borrower {
-            panic!("only property owner can open loan");
+            return Err(MortgagePoolError::OnlyPropertyOwner);
         }
 
         let valuation = property.valuation;
         let max_loan = valuation * (MAX_LTV_BPS as i128) / 10000;
         if amount > max_loan {
-            panic!("loan amount exceeds max LTV");
+            return Err(MortgagePoolError::LoanExceedsMaxLtv);
         }
 
         let total_liq: i128 = env
@@ -85,10 +147,14 @@ impl MortgagePool {
             .get(&DataKey::TotalLiquidity)
             .unwrap_or(0);
         if amount > total_liq {
-            panic!("insufficient pool liquidity");
+            return Err(MortgagePoolError::InsufficientPoolLiquidity);
         }
 
-        let mut counter: u64 = env.storage().instance().get(&DataKey::LoanCounter).unwrap();
+        let mut counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LoanCounter)
+            .ok_or(MortgagePoolError::Unauthorized)?;
         counter += 1;
         env.storage()
             .instance()
@@ -116,7 +182,7 @@ impl MortgagePool {
             .storage()
             .instance()
             .get(&DataKey::LiquidityToken)
-            .unwrap();
+            .ok_or(MortgagePoolError::Unauthorized)?;
         let vault = env.current_contract_address();
         env.invoke_contract::<()>(
             &token,
@@ -132,35 +198,36 @@ impl MortgagePool {
             (borrower, prop_id, amount),
         );
 
-        counter
+        Ok(counter)
     }
 
     /// Repays `amount` of a loan. Only callable by the borrower.
-    pub fn repay(env: Env, borrower: Address, loan_id: u64, amount: i128) {
+    pub fn repay(
+        env: Env,
+        borrower: Address,
+        loan_id: u64,
+        amount: i128,
+    ) -> Result<(), MortgagePoolError> {
         borrower.require_auth();
         let mut loan: LoanData = env
             .storage()
             .instance()
             .get(&DataKey::Loan(loan_id))
-            .unwrap_or_else(|| panic!("loan not found"));
+            .ok_or(MortgagePoolError::LoanNotFound)?;
         if loan.status != LoanStatus::Active {
-            panic!("loan is not active");
+            return Err(MortgagePoolError::LoanNotActive);
         }
 
         let interest = MortgagePool::calculate_interest_internal(env.clone(), &loan);
         let total_due = loan.amount + interest;
 
-        let repayment = if amount > total_due {
-            total_due
-        } else {
-            amount
-        };
+        let repayment = if amount > total_due { total_due } else { amount };
 
         let token: Address = env
             .storage()
             .instance()
             .get(&DataKey::LiquidityToken)
-            .unwrap();
+            .ok_or(MortgagePoolError::Unauthorized)?;
         let vault = env.current_contract_address();
         env.invoke_contract::<()>(
             &token,
@@ -196,23 +263,28 @@ impl MortgagePool {
             (Symbol::new(&env, "Repaid"), loan_id),
             (borrower, repayment),
         );
+        Ok(())
     }
 
     /// Liquidates an underwater loan (LTV > 80%). Callable by anyone.
-    pub fn liquidate(env: Env, liquidator: Address, loan_id: u64) {
+    pub fn liquidate(
+        env: Env,
+        liquidator: Address,
+        loan_id: u64,
+    ) -> Result<(), MortgagePoolError> {
         liquidator.require_auth();
         let mut loan: LoanData = env
             .storage()
             .instance()
             .get(&DataKey::Loan(loan_id))
-            .unwrap_or_else(|| panic!("loan not found"));
+            .ok_or(MortgagePoolError::LoanNotFound)?;
         if loan.status != LoanStatus::Active {
-            panic!("loan is not active");
+            return Err(MortgagePoolError::LoanNotActive);
         }
 
-        let health = MortgagePool::loan_health(env.clone(), loan_id);
+        let health = MortgagePool::loan_health(env.clone(), loan_id)?;
         if health.is_healthy {
-            panic!("loan is healthy, cannot liquidate");
+            return Err(MortgagePoolError::LoanIsHealthy);
         }
 
         loan.status = LoanStatus::Liquidated;
@@ -220,17 +292,21 @@ impl MortgagePool {
 
         env.events()
             .publish((Symbol::new(&env, "Liquidated"), loan_id), liquidator);
+        Ok(())
     }
 
     /// Deposits tokens to the liquidity pool. Callable by any LP.
-    pub fn deposit_liquidity(env: Env, lp: Address, amount: i128) {
+    pub fn deposit_liquidity(env: Env, lp: Address, amount: i128) -> Result<(), MortgagePoolError> {
+        if Self::is_paused(env.clone()) {
+            return Err(MortgagePoolError::ContractPaused);
+        }
         lp.require_auth();
 
         let token: Address = env
             .storage()
             .instance()
             .get(&DataKey::LiquidityToken)
-            .unwrap();
+            .ok_or(MortgagePoolError::Unauthorized)?;
         let vault = env.current_contract_address();
         env.invoke_contract::<()>(
             &token,
@@ -253,16 +329,22 @@ impl MortgagePool {
 
         env.events()
             .publish((Symbol::new(&env, "LiquidityDeposited"),), (lp, amount));
+        Ok(())
     }
 
-    /// Withdraws tokens from the liquidity pool. Callable by the LP.
-    pub fn withdraw_liquidity(env: Env, lp: Address, amount: i128) {
+    /// Withdraws tokens from the liquidity pool. Only allowed when total available liquidity
+    /// (not lent out) covers the withdrawal, protecting active borrowers.
+    pub fn withdraw_liquidity(
+        env: Env,
+        lp: Address,
+        amount: i128,
+    ) -> Result<(), MortgagePoolError> {
         lp.require_auth();
 
         let key = DataKey::Liquidity(lp.clone());
         let balance: i128 = env.storage().instance().get(&key).unwrap_or(0);
         if balance < amount {
-            panic!("insufficient LP balance");
+            return Err(MortgagePoolError::InsufficientLpBalance);
         }
 
         let total_liq: i128 = env
@@ -271,7 +353,7 @@ impl MortgagePool {
             .get(&DataKey::TotalLiquidity)
             .unwrap_or(0);
         if total_liq < amount {
-            panic!("insufficient pool liquidity");
+            return Err(MortgagePoolError::InsufficientPoolLiquidity);
         }
 
         env.storage().instance().set(&key, &(balance - amount));
@@ -283,28 +365,32 @@ impl MortgagePool {
             .storage()
             .instance()
             .get(&DataKey::LiquidityToken)
-            .unwrap();
+            .ok_or(MortgagePoolError::Unauthorized)?;
         let vault = env.current_contract_address();
         env.invoke_contract::<()>(
             &token,
             &Symbol::new(&env, "transfer"),
             Vec::from_array(&env, [vault.to_val(), lp.to_val(), amount.into_val(&env)]),
         );
+
+        env.events()
+            .publish((Symbol::new(&env, "LiquidityWithdrawn"),), (lp, amount));
+        Ok(())
     }
 
     /// Returns the HealthFactor for a loan, indicating whether it's at risk of liquidation.
-    pub fn loan_health(env: Env, loan_id: u64) -> HealthFactor {
+    pub fn loan_health(env: Env, loan_id: u64) -> Result<HealthFactor, MortgagePoolError> {
         let loan: LoanData = env
             .storage()
             .instance()
             .get(&DataKey::Loan(loan_id))
-            .unwrap_or_else(|| panic!("loan not found"));
+            .ok_or(MortgagePoolError::LoanNotFound)?;
 
         let property_reg: Address = env
             .storage()
             .instance()
             .get(&DataKey::PropertyRegistry)
-            .unwrap();
+            .ok_or(MortgagePoolError::Unauthorized)?;
         let property: PropertyData = env.invoke_contract(
             &property_reg,
             &Symbol::new(&env, "get_property"),
@@ -315,10 +401,34 @@ impl MortgagePool {
         let current_debt = loan.amount + interest;
         let current_ltv = (current_debt * 10000 / property.valuation) as u32;
 
-        HealthFactor {
+        Ok(HealthFactor {
             ratio: current_ltv,
             is_healthy: current_ltv < LIQUIDATION_THRESHOLD_BPS,
-        }
+        })
+    }
+
+    /// Returns the full LoanData for a given loan ID.
+    pub fn get_loan(env: Env, loan_id: u64) -> Result<LoanData, MortgagePoolError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Loan(loan_id))
+            .ok_or(MortgagePoolError::LoanNotFound)
+    }
+
+    /// Returns the LP deposit balance for a given address.
+    pub fn lp_balance(env: Env, lp: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Liquidity(lp))
+            .unwrap_or(0)
+    }
+
+    /// Returns total available liquidity in the pool.
+    pub fn total_liquidity(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalLiquidity)
+            .unwrap_or(0)
     }
 
     fn calculate_interest_internal(env: Env, loan: &LoanData) -> i128 {
@@ -406,14 +516,14 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "loan amount exceeds max LTV")]
-    fn test_ltv_enforcement() {
+    fn test_ltv_enforcement_returns_error() {
         let (env, admin, owner, pool, token, _, _) = setup();
         let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token);
         sac.mint(&admin, &100_000i128);
         pool.deposit_liquidity(&admin, &100_000i128);
 
-        pool.open_loan(&owner, &1u64, &80_000i128);
+        let result = pool.try_open_loan(&owner, &1u64, &80_000i128);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -460,5 +570,68 @@ mod test {
         assert!(health.ratio > 8000);
 
         pool.liquidate(&admin, &loan_id);
+    }
+
+    #[test]
+    fn test_get_loan() {
+        let (env, admin, owner, pool, token, _, _) = setup();
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        sac.mint(&admin, &100_000i128);
+        pool.deposit_liquidity(&admin, &50_000i128);
+
+        let loan_id = pool.open_loan(&owner, &1u64, &30_000i128);
+        let loan = pool.get_loan(&loan_id);
+        assert_eq!(loan.borrower, owner);
+        assert_eq!(loan.amount, 30_000);
+    }
+
+    #[test]
+    fn test_lp_balance() {
+        let (env, admin, _owner, pool, token, _, _) = setup();
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        sac.mint(&admin, &100_000i128);
+        pool.deposit_liquidity(&admin, &50_000i128);
+        assert_eq!(pool.lp_balance(&admin), 50_000);
+        assert_eq!(pool.total_liquidity(), 50_000);
+    }
+
+    #[test]
+    fn test_pause_blocks_open_loan() {
+        let (env, admin, owner, pool, token, _, _) = setup();
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        sac.mint(&admin, &100_000i128);
+        pool.deposit_liquidity(&admin, &50_000i128);
+
+        pool.pause();
+        assert!(pool.is_paused());
+
+        let result = pool.try_open_loan(&owner, &1u64, &30_000i128);
+        assert!(result.is_err());
+
+        pool.unpause();
+        assert!(!pool.is_paused());
+        let loan_id = pool.open_loan(&owner, &1u64, &30_000i128);
+        assert_eq!(loan_id, 1);
+    }
+
+    #[test]
+    fn test_withdraw_liquidity_guard() {
+        let (env, admin, owner, pool, token, _, _) = setup();
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        sac.mint(&admin, &100_000i128);
+        pool.deposit_liquidity(&admin, &50_000i128);
+
+        // Open a loan consuming 30_000 of the 50_000 pool
+        pool.open_loan(&owner, &1u64, &30_000i128);
+        // Pool now only has 20_000 free
+        assert_eq!(pool.total_liquidity(), 20_000);
+
+        // LP cannot withdraw more than remaining free liquidity
+        let result = pool.try_withdraw_liquidity(&admin, &40_000i128);
+        assert!(result.is_err());
+
+        // Can withdraw within available liquidity
+        pool.withdraw_liquidity(&admin, &10_000i128);
+        assert_eq!(pool.lp_balance(&admin), 40_000);
     }
 }

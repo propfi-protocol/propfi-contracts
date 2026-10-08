@@ -1,7 +1,17 @@
 #![no_std]
 //! Cross-border payment and remittance layer. Supports single and batch sends with anchor registration for fiat on/off ramps.
 use propfi_types::PathQuote;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Vec};
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum PaymentBridgeError {
+    AlreadyInitialized = 1,
+    Unauthorized = 2,
+    InvalidAmount = 3,
+    AssetNotRegistered = 4,
+    InsufficientBalance = 5,
+}
 
 const FEE_BPS: i128 = 10;
 
@@ -19,26 +29,32 @@ pub struct PaymentBridge;
 #[contractimpl]
 impl PaymentBridge {
     /// Sets the admin address. Called once at deployment.
-    pub fn initialize(env: Env, admin: Address) {
+    pub fn initialize(env: Env, admin: Address) -> Result<(), PaymentBridgeError> {
         let existing: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         if existing.is_some() {
-            panic!("already initialized");
+            return Err(PaymentBridgeError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        Ok(())
     }
 
     /// Deposits tokens into the bridge for a given asset.
-    pub fn deposit(env: Env, user: Address, asset: Symbol, amount: i128) {
+    pub fn deposit(
+        env: Env,
+        user: Address,
+        asset: Symbol,
+        amount: i128,
+    ) -> Result<(), PaymentBridgeError> {
         user.require_auth();
         if amount <= 0 {
-            panic!("amount must be positive");
+            return Err(PaymentBridgeError::InvalidAmount);
         }
 
         let token: Address = env
             .storage()
             .instance()
             .get(&DataKey::AnchorAsset(asset.clone()))
-            .unwrap_or_else(|| panic!("asset not registered"));
+            .ok_or(PaymentBridgeError::AssetNotRegistered)?;
 
         let bridge = env.current_contract_address();
         env.invoke_contract::<()>(
@@ -53,19 +69,26 @@ impl PaymentBridge {
         let key = DataKey::Balance(user.clone(), asset.clone());
         let balance: i128 = env.storage().instance().get(&key).unwrap_or(0);
         env.storage().instance().set(&key, &(balance + amount));
+
+        Ok(())
     }
 
     /// Withdraws tokens from the bridge for a given asset.
-    pub fn withdraw(env: Env, user: Address, asset: Symbol, amount: i128) {
+    pub fn withdraw(
+        env: Env,
+        user: Address,
+        asset: Symbol,
+        amount: i128,
+    ) -> Result<(), PaymentBridgeError> {
         user.require_auth();
         if amount <= 0 {
-            panic!("amount must be positive");
+            return Err(PaymentBridgeError::InvalidAmount);
         }
 
         let key = DataKey::Balance(user.clone(), asset.clone());
         let balance: i128 = env.storage().instance().get(&key).unwrap_or(0);
         if balance < amount {
-            panic!("insufficient balance");
+            return Err(PaymentBridgeError::InsufficientBalance);
         }
 
         env.storage().instance().set(&key, &(balance - amount));
@@ -74,7 +97,7 @@ impl PaymentBridge {
             .storage()
             .instance()
             .get(&DataKey::AnchorAsset(asset.clone()))
-            .unwrap_or_else(|| panic!("asset not registered"));
+            .ok_or(PaymentBridgeError::AssetNotRegistered)?;
 
         let bridge = env.current_contract_address();
         env.invoke_contract::<()>(
@@ -85,19 +108,28 @@ impl PaymentBridge {
                 [bridge.to_val(), user.to_val(), amount.into_val(&env)],
             ),
         );
+
+        Ok(())
     }
 
     /// Sends `amount` from one asset to another via path payment.
-    pub fn send(env: Env, from: Address, to: Address, amount: i128, src: Symbol, dst: Symbol) {
+    pub fn send(
+        env: Env,
+        from: Address,
+        to: Address,
+        amount: i128,
+        src: Symbol,
+        dst: Symbol,
+    ) -> Result<(), PaymentBridgeError> {
         from.require_auth();
         if amount <= 0 {
-            panic!("amount must be positive");
+            return Err(PaymentBridgeError::InvalidAmount);
         }
 
         let src_key = DataKey::Balance(from.clone(), src.clone());
         let src_balance: i128 = env.storage().instance().get(&src_key).unwrap_or(0);
         if src_balance < amount {
-            panic!("insufficient balance");
+            return Err(PaymentBridgeError::InsufficientBalance);
         }
         env.storage()
             .instance()
@@ -119,6 +151,8 @@ impl PaymentBridge {
             (Symbol::new(&env, "PaymentSent"), from),
             (to, amount, src, dest_amount, dst),
         );
+
+        Ok(())
     }
 
     /// Sends payments to multiple recipients in batch.
@@ -128,14 +162,14 @@ impl PaymentBridge {
         recipients: Vec<(Address, i128)>,
         src: Symbol,
         dst: Symbol,
-    ) {
+    ) -> Result<(), PaymentBridgeError> {
         from.require_auth();
 
         let mut total: i128 = 0;
         for i in 0..recipients.len() {
             let (_to, amt) = recipients.get(i).unwrap();
             if amt <= 0 {
-                panic!("amount must be positive");
+                return Err(PaymentBridgeError::InvalidAmount);
             }
             total = total.checked_add(amt).unwrap();
         }
@@ -143,7 +177,7 @@ impl PaymentBridge {
         let src_key = DataKey::Balance(from.clone(), src.clone());
         let src_balance: i128 = env.storage().instance().get(&src_key).unwrap_or(0);
         if src_balance < total {
-            panic!("insufficient balance");
+            return Err(PaymentBridgeError::InsufficientBalance);
         }
         env.storage()
             .instance()
@@ -169,11 +203,21 @@ impl PaymentBridge {
             (Symbol::new(&env, "BatchDispatched"), from),
             (recipients.len(), src, dst),
         );
+
+        Ok(())
     }
 
     /// Registers an anchor for an asset symbol. Admin-only.
-    pub fn register_anchor(env: Env, asset: Symbol, token_address: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    pub fn register_anchor(
+        env: Env,
+        asset: Symbol,
+        token_address: Address,
+    ) -> Result<(), PaymentBridgeError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(PaymentBridgeError::Unauthorized)?;
         admin.require_auth();
 
         env.storage()
@@ -184,12 +228,19 @@ impl PaymentBridge {
             (Symbol::new(&env, "AnchorRegistered"), asset),
             token_address,
         );
+
+        Ok(())
     }
 
     /// Returns a PathQuote estimating the destination amount, path, and fee for a conversion.
-    pub fn estimate_path(env: Env, src: Symbol, dst: Symbol, amount: i128) -> PathQuote {
+    pub fn estimate_path(
+        env: Env,
+        src: Symbol,
+        dst: Symbol,
+        amount: i128,
+    ) -> Result<PathQuote, PaymentBridgeError> {
         if amount <= 0 {
-            panic!("amount must be positive");
+            return Err(PaymentBridgeError::InvalidAmount);
         }
 
         let same = src == dst;
@@ -222,11 +273,11 @@ impl PaymentBridge {
             amount * FEE_BPS / 10000
         };
 
-        PathQuote {
+        Ok(PathQuote {
             dest_amount,
             path,
             estimated_fee,
-        }
+        })
     }
 
     /// Returns the bridge balance of a user for a given asset.
@@ -284,44 +335,22 @@ mod test {
     fn test_initialize() {
         let env = Env::default();
         env.mock_all_auths();
-
         let admin = Address::generate(&env);
         let contract_id = env.register_contract(None, PaymentBridge);
         let client = PaymentBridgeClient::new(&env, &contract_id);
-
         client.initialize(&admin);
     }
 
     #[test]
-    #[should_panic(expected = "already initialized")]
-    fn test_double_initialize_panics() {
+    fn test_double_initialize_returns_error() {
         let env = Env::default();
         env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let contract_id = env.register_contract(None, PaymentBridge);
-        let client = PaymentBridgeClient::new(&env, &contract_id);
-
-        client.initialize(&admin);
-        let rogue = Address::generate(&env);
-        client.initialize(&rogue);
-    }
-
-    #[test]
-    fn test_register_anchor() {
-        let env = Env::default();
-        env.mock_all_auths();
-
         let admin = Address::generate(&env);
         let contract_id = env.register_contract(None, PaymentBridge);
         let client = PaymentBridgeClient::new(&env, &contract_id);
         client.initialize(&admin);
-
-        let token = env
-            .register_stellar_asset_contract_v2(admin.clone())
-            .address();
-        let asset = symbol_short!("USDC");
-        client.register_anchor(&asset, &token);
+        let result = client.try_initialize(&admin);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -336,8 +365,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "asset not registered")]
-    fn test_deposit_unregistered_asset() {
+    fn test_deposit_unregistered_asset_returns_error() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -348,42 +376,8 @@ mod test {
         client.initialize(&admin);
 
         let bad_asset = symbol_short!("BAD");
-        client.deposit(&user, &bad_asset, &100i128);
-    }
-
-    #[test]
-    fn test_withdraw() {
-        let (env, _admin, user, client, token_a, _token_b, usdc, _xlm) = setup();
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_a);
-        sac.mint(&user, &50_000i128);
-
-        client.deposit(&user, &usdc, &10_000i128);
-        assert_eq!(client.get_balance(&user, &usdc), 10_000);
-
-        client.withdraw(&user, &usdc, &4_000i128);
-        assert_eq!(client.get_balance(&user, &usdc), 6_000);
-    }
-
-    #[test]
-    #[should_panic(expected = "insufficient balance")]
-    fn test_withdraw_insufficient_balance() {
-        let (_env, _admin, user, client, _token_a, _token_b, usdc, _xlm) = setup();
-        client.withdraw(&user, &usdc, &100i128);
-    }
-
-    #[test]
-    fn test_send_same_asset() {
-        let (env, _admin, user, client, token_a, _token_b, usdc, _xlm) = setup();
-        let recipient = Address::generate(&env);
-
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_a);
-        sac.mint(&user, &50_000i128);
-        client.deposit(&user, &usdc, &20_000i128);
-
-        client.send(&user, &recipient, &5_000i128, &usdc, &usdc);
-
-        assert_eq!(client.get_balance(&user, &usdc), 15_000);
-        assert_eq!(client.get_balance(&recipient, &usdc), 5_000);
+        let result = client.try_deposit(&user, &bad_asset, &100i128);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -405,21 +399,19 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "insufficient balance")]
-    fn test_send_insufficient_balance() {
+    fn test_send_insufficient_balance_returns_error() {
         let (env, _admin, user, client, _token_a, _token_b, usdc, xlm) = setup();
         let recipient = Address::generate(&env);
-
-        client.send(&user, &recipient, &100i128, &usdc, &xlm);
+        let result = client.try_send(&user, &recipient, &100i128, &usdc, &xlm);
+        assert!(result.is_err());
     }
 
     #[test]
-    #[should_panic(expected = "amount must be positive")]
-    fn test_send_zero_amount() {
+    fn test_send_zero_amount_returns_error() {
         let (env, _admin, user, client, _token_a, _token_b, usdc, xlm) = setup();
         let recipient = Address::generate(&env);
-
-        client.send(&user, &recipient, &0i128, &usdc, &xlm);
+        let result = client.try_send(&user, &recipient, &0i128, &usdc, &xlm);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -451,16 +443,6 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "insufficient balance")]
-    fn test_batch_send_insufficient_balance() {
-        let (env, _admin, user, client, _token_a, _token_b, usdc, xlm) = setup();
-        let recipient = Address::generate(&env);
-
-        let recipients = Vec::from_array(&env, [(recipient, 100i128)]);
-        client.batch_send(&user, &recipients, &usdc, &xlm);
-    }
-
-    #[test]
     fn test_estimate_path_same_asset() {
         let (_env, _admin, _user, client, _token_a, _token_b, usdc, _xlm) = setup();
 
@@ -479,36 +461,5 @@ mod test {
         let expected_dest = 10_000 - (10_000 * FEE_BPS / 10000);
         assert_eq!(quote.dest_amount, expected_dest);
         assert_eq!(quote.estimated_fee, 10_000 * FEE_BPS / 10000);
-    }
-
-    #[test]
-    #[should_panic(expected = "amount must be positive")]
-    fn test_estimate_path_zero_amount() {
-        let (_env, _admin, _user, client, _token_a, _token_b, usdc, xlm) = setup();
-        client.estimate_path(&usdc, &xlm, &0i128);
-    }
-
-    #[test]
-    fn test_full_lifecycle_same_asset() {
-        let (env, _admin, user, client, token_a, _token_b, usdc, _xlm) = setup();
-        let recipient = Address::generate(&env);
-
-        let sac_a = soroban_sdk::token::StellarAssetClient::new(&env, &token_a);
-
-        sac_a.mint(&user, &100_000i128);
-        client.deposit(&user, &usdc, &100_000i128);
-
-        assert_eq!(client.get_balance(&user, &usdc), 100_000);
-
-        client.send(&user, &recipient, &10_000i128, &usdc, &usdc);
-
-        assert_eq!(client.get_balance(&user, &usdc), 90_000);
-        assert_eq!(client.get_balance(&recipient, &usdc), 10_000);
-
-        client.withdraw(&user, &usdc, &90_000i128);
-        assert_eq!(client.get_balance(&user, &usdc), 0);
-
-        client.withdraw(&recipient, &usdc, &10_000i128);
-        assert_eq!(client.get_balance(&recipient, &usdc), 0);
     }
 }

@@ -248,7 +248,6 @@ fn test_cross_border_payment() {
 }
 
 #[test]
-#[should_panic(expected = "compliance check failed")]
 fn test_compliance_gate_blocks_unattested_buy() {
     let env = create_env();
     let admin = Address::generate(&env);
@@ -277,11 +276,12 @@ fn test_compliance_gate_blocks_unattested_buy() {
     );
 
     mint_tokens(&env, &token, &buyer, 100_000);
-    vault_client.buy_fraction(&buyer, &prop_id, &10u128);
+    // Unattested buyer should fail with a typed error
+    let result = vault_client.try_buy_fraction(&buyer, &prop_id, &10u128);
+    assert!(result.is_err());
 }
 
 #[test]
-#[should_panic(expected = "compliance check failed")]
 fn test_compliance_gate_blocks_transfer() {
     let env = create_env();
     let admin = Address::generate(&env);
@@ -297,7 +297,8 @@ fn test_compliance_gate_blocks_transfer() {
     let prop_id = register_property(&env, &prop_reg, &owner, 100_000, jurisdiction);
 
     let pr_client = PropertyRegistryClient::new(&env, &prop_reg);
-    pr_client.transfer_ownership(&prop_id, &non_compliant, &compliance);
+    let result = pr_client.try_transfer_ownership(&prop_id, &non_compliant, &compliance);
+    assert!(result.is_err());
 }
 
 #[test]
@@ -361,4 +362,137 @@ fn test_governance_lifecycle() {
 
     let executed_proposal = gov_client.get_proposal(&proposal_id);
     assert!(executed_proposal.executed);
+}
+
+#[test]
+fn test_fraction_transfer_between_compliant_users() {
+    let env = create_env();
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let jurisdiction = symbol_short!("US");
+
+    let compliance = deploy_compliance(&env, &admin);
+    let _oracle = deploy_oracle(&env, &admin, 3600);
+    let prop_reg = deploy_property_registry(&env, &admin);
+    let vault = deploy_fraction_vault(&env, &admin);
+    let token = create_token(&env, &admin);
+
+    attest_user(&env, &compliance, &user, jurisdiction.clone());
+    attest_user(&env, &compliance, &recipient, jurisdiction.clone());
+
+    let prop_id = register_property(&env, &prop_reg, &admin, 100_000, jurisdiction);
+
+    let vault_client = FractionVaultClient::new(&env, &vault);
+    vault_client.fractionalize(
+        &prop_id,
+        &1000u128,
+        &100i128,
+        &token,
+        &prop_reg,
+        &compliance,
+    );
+
+    mint_tokens(&env, &token, &user, 100_000);
+    vault_client.buy_fraction(&user, &prop_id, &50u128);
+    assert_eq!(vault_client.get_balance(&user, &prop_id), 50);
+
+    // Transfer fractions to compliant recipient (no payment needed)
+    vault_client.transfer_fraction(&user, &recipient, &prop_id, &20u128);
+
+    assert_eq!(vault_client.get_balance(&user, &prop_id), 30);
+    assert_eq!(vault_client.get_balance(&recipient, &prop_id), 20);
+    assert_eq!(vault_client.total_holders(&prop_id), 2);
+}
+
+#[test]
+fn test_multiple_jurisdictions_compliance() {
+    let env = create_env();
+    let admin = Address::generate(&env);
+    let investor = Address::generate(&env);
+    let us = symbol_short!("US");
+    let eu = Symbol::new(&env, "EU");
+
+    let compliance = deploy_compliance(&env, &admin);
+    let compliance_client = ComplianceRegistryClient::new(&env, &compliance);
+
+    let proof = soroban_sdk::Bytes::from_slice(&env, b"proof");
+    // Attest the same user for two jurisdictions simultaneously
+    compliance_client.attest(&investor, &proof, &us, &365u32);
+    compliance_client.attest(&investor, &proof, &eu, &180u32);
+
+    // User should be compliant in both jurisdictions at the same time
+    assert!(compliance_client.is_compliant(&investor, &us));
+    assert!(compliance_client.is_compliant(&investor, &eu));
+
+    // Revoking one should not affect the other
+    compliance_client.revoke(&investor, &us);
+    assert!(!compliance_client.is_compliant(&investor, &us));
+    assert!(compliance_client.is_compliant(&investor, &eu));
+}
+
+#[test]
+fn test_mortgage_pool_query_functions() {
+    let env = create_env();
+    let admin = Address::generate(&env);
+    let borrower = Address::generate(&env);
+    let jurisdiction = symbol_short!("US");
+    let asset = Symbol::new(&env, "PROP_USD");
+
+    let prop_reg = deploy_property_registry(&env, &admin);
+    let oracle = deploy_oracle(&env, &admin, 86400);
+    let token = create_token(&env, &admin);
+
+    let prop_id = register_property(&env, &prop_reg, &borrower, 100_000, jurisdiction);
+    setup_oracle_with_price(&env, &oracle, &admin, &asset, 100_000, 100);
+
+    let pool = deploy_mortgage_pool(&env, &admin, &token, &prop_reg, &oracle);
+    let pool_client = MortgagePoolClient::new(&env, &pool);
+
+    mint_tokens(&env, &token, &admin, 100_000);
+    pool_client.deposit_liquidity(&admin, &50_000i128);
+
+    // Test lp_balance and total_liquidity
+    assert_eq!(pool_client.lp_balance(&admin), 50_000);
+    assert_eq!(pool_client.total_liquidity(), 50_000);
+
+    // Open a loan and test get_loan
+    let loan_id = pool_client.open_loan(&borrower, &prop_id, &30_000i128);
+    let loan = pool_client.get_loan(&loan_id);
+    assert_eq!(loan.borrower, borrower);
+    assert_eq!(loan.amount, 30_000);
+    assert_eq!(loan.prop_id, prop_id);
+
+    // Remaining free liquidity
+    assert_eq!(pool_client.total_liquidity(), 20_000);
+}
+
+#[test]
+fn test_oracle_weight_update() {
+    let env = create_env();
+    let admin = Address::generate(&env);
+    let oracle1 = Address::generate(&env);
+    let oracle2 = Address::generate(&env);
+    let asset = Symbol::new(&env, "PROP_USD");
+
+    let oracle_adapter = deploy_oracle(&env, &admin, 86400);
+    let oracle_client = OracleAdapterClient::new(&env, &oracle_adapter);
+
+    oracle_client.add_oracle(&oracle1, &100u32);
+    oracle_client.add_oracle(&oracle2, &100u32);
+
+    oracle_client.submit_price(&oracle1, &asset, &50_000i128);
+    oracle_client.submit_price(&oracle2, &asset, &60_000i128);
+
+    let price_equal = oracle_client.get_price(&asset);
+    assert_eq!(price_equal.price, 55_000);
+
+    // Give oracle1 4x the weight
+    oracle_client.update_oracle_weight(&oracle1, &400u32);
+    // Re-submit to recalculate
+    oracle_client.submit_price(&oracle1, &asset, &50_000i128);
+
+    let price_weighted = oracle_client.get_price(&asset);
+    // Expected: (50000*400 + 60000*100) / 500 = 52000
+    assert_eq!(price_weighted.price, 52_000);
 }
