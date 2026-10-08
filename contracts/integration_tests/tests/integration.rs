@@ -344,7 +344,7 @@ fn test_governance_lifecycle() {
 
     let calldata = Bytes::from_array(&env, &[]);
     let description = String::from_str(&env, "Update protocol parameters");
-    let proposal_id = gov_client.propose(&1u32, &calldata, &description);
+    let proposal_id = gov_client.propose(&voter1, &1u32, &calldata, &description);
     assert_eq!(proposal_id, 1);
 
     gov_client.vote(&voter1, &proposal_id, &true);

@@ -123,13 +123,22 @@ impl Governance {
         Ok(())
     }
 
-    /// Creates a new proposal. Anyone can propose.
+    /// Creates a new proposal. The proposer must authorize and hold at least one fraction.
     pub fn propose(
         env: Env,
+        proposer: Address,
         action_type: u32,
         calldata: Bytes,
         description: String,
-    ) -> u64 {
+    ) -> Result<u64, GovernanceError> {
+        proposer.require_auth();
+
+        // Only fraction holders may create proposals
+        let power = Governance::voting_power_internal(&env, proposer.clone());
+        if power == 0 {
+            return Err(GovernanceError::NoVotingPower);
+        }
+
         let mut counter: u64 = env
             .storage()
             .instance()
@@ -144,7 +153,7 @@ impl Governance {
         let quorum: u128 = env.storage().instance().get(&DataKey::Quorum).unwrap_or(0);
 
         let proposal = ProposalData {
-            proposer: env.current_contract_address(),
+            proposer: proposer.clone(),
             action_type,
             calldata,
             description,
@@ -162,10 +171,10 @@ impl Governance {
 
         env.events().publish(
             (Symbol::new(&env, "ProposalCreated"), counter),
-            (action_type, now + VOTING_PERIOD),
+            (proposer, action_type, now + VOTING_PERIOD),
         );
 
-        counter
+        Ok(counter)
     }
 
     /// Casts a vote (for/against) on a proposal. Voter must hold fractions.
@@ -355,6 +364,24 @@ mod test {
         (vault_id, prop_id)
     }
 
+    fn give_voting_power(
+        env: &Env,
+        vault_client: &FractionVaultClient,
+        vault_id: &Address,
+        prop_id: u64,
+        user: &Address,
+        amount: u128,
+    ) {
+        let info = vault_client.get_fraction_info(&prop_id);
+        let compliance_client = ComplianceRegistryClient::new(env, &info.4);
+        let proof = soroban_sdk::Bytes::from_slice(env, b"proof");
+        compliance_client.attest(user, &proof, &symbol_short!("US"), &365u32);
+        let sac = soroban_sdk::token::StellarAssetClient::new(env, &info.2);
+        sac.mint(user, &(amount as i128 * info.1));
+        vault_client.buy_fraction(user, &prop_id, &amount);
+        let _ = vault_id; // kept for future use
+    }
+
     fn setup() -> (
         Env,
         Address,
@@ -412,15 +439,28 @@ mod test {
 
     #[test]
     fn test_propose() {
-        let (env, _admin, _user, client, _vault_id, _prop_id) = setup();
+        let (env, _admin, user, client, vault_id, prop_id) = setup();
         let calldata = Bytes::from_array(&env, &[1, 2, 3]);
         let description = String::from_str(&env, "Test proposal");
 
-        let prop_id = client.propose(&1u32, &calldata, &description);
-        assert_eq!(prop_id, 1);
+        // Give user voting power first
+        let vault_client = FractionVaultClient::new(&env, &vault_id);
+        let info = vault_client.get_fraction_info(&prop_id);
+        ComplianceRegistryClient::new(&env, &info.4).attest(
+            &user,
+            &Bytes::from_array(&env, &[]),
+            &symbol_short!("US"),
+            &365u32,
+        );
+        soroban_sdk::token::StellarAssetClient::new(&env, &info.2).mint(&user, &100_000i128);
+        vault_client.buy_fraction(&user, &prop_id, &10u128);
 
-        let proposal = client.get_proposal(&prop_id);
+        let pid = client.propose(&user, &1u32, &calldata, &description);
+        assert_eq!(pid, 1);
+
+        let proposal = client.get_proposal(&pid);
         assert_eq!(proposal.action_type, 1);
+        assert_eq!(proposal.proposer, user);
         assert!(!proposal.executed);
         assert_eq!(proposal.for_votes, 0);
         assert_eq!(proposal.against_votes, 0);
@@ -430,22 +470,12 @@ mod test {
     fn test_vote_for() {
         let (env, _admin, user, client, vault_id, prop_id) = setup();
 
+        let vault_client = FractionVaultClient::new(&env, &vault_id);
+        give_voting_power(&env, &vault_client, &vault_id, prop_id, &user, 100);
+
         let calldata = Bytes::from_array(&env, &[]);
         let description = String::from_str(&env, "Test");
-        let proposal_id = client.propose(&1u32, &calldata, &description);
-
-        let vault_client = FractionVaultClient::new(&env, &vault_id);
-        let info = vault_client.get_fraction_info(&prop_id);
-        let compliance_id = info.4;
-        let compliance_client = ComplianceRegistryClient::new(&env, &compliance_id);
-
-        let proof = soroban_sdk::Bytes::from_slice(&env, b"proof");
-        compliance_client.attest(&user, &proof, &symbol_short!("US"), &365u32);
-
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &info.2);
-        sac.mint(&user, &100_000i128);
-
-        vault_client.buy_fraction(&user, &prop_id, &100u128);
+        let proposal_id = client.propose(&user, &1u32, &calldata, &description);
 
         client.vote(&user, &proposal_id, &true);
 
@@ -458,19 +488,12 @@ mod test {
     fn test_vote_against() {
         let (env, _admin, user, client, vault_id, prop_id) = setup();
 
+        let vault_client = FractionVaultClient::new(&env, &vault_id);
+        give_voting_power(&env, &vault_client, &vault_id, prop_id, &user, 50);
+
         let calldata = Bytes::from_array(&env, &[]);
         let description = String::from_str(&env, "Test");
-        let proposal_id = client.propose(&1u32, &calldata, &description);
-
-        let vault_client = FractionVaultClient::new(&env, &vault_id);
-        let info = vault_client.get_fraction_info(&prop_id);
-        let compliance_client = ComplianceRegistryClient::new(&env, &info.4);
-        let proof = soroban_sdk::Bytes::from_slice(&env, b"proof");
-        compliance_client.attest(&user, &proof, &symbol_short!("US"), &365u32);
-
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &info.2);
-        sac.mint(&user, &100_000i128);
-        vault_client.buy_fraction(&user, &prop_id, &50u128);
+        let proposal_id = client.propose(&user, &1u32, &calldata, &description);
 
         client.vote(&user, &proposal_id, &false);
 
@@ -483,19 +506,12 @@ mod test {
     fn test_double_vote_returns_error() {
         let (env, _admin, user, client, vault_id, prop_id) = setup();
 
+        let vault_client = FractionVaultClient::new(&env, &vault_id);
+        give_voting_power(&env, &vault_client, &vault_id, prop_id, &user, 100);
+
         let calldata = Bytes::from_array(&env, &[]);
         let description = String::from_str(&env, "Test");
-        let proposal_id = client.propose(&1u32, &calldata, &description);
-
-        let vault_client = FractionVaultClient::new(&env, &vault_id);
-        let info = vault_client.get_fraction_info(&prop_id);
-        let compliance_client = ComplianceRegistryClient::new(&env, &info.4);
-        let proof = soroban_sdk::Bytes::from_slice(&env, b"proof");
-        compliance_client.attest(&user, &proof, &symbol_short!("US"), &365u32);
-
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &info.2);
-        sac.mint(&user, &100_000i128);
-        vault_client.buy_fraction(&user, &prop_id, &100u128);
+        let proposal_id = client.propose(&user, &1u32, &calldata, &description);
 
         client.vote(&user, &proposal_id, &true);
         let result = client.try_vote(&user, &proposal_id, &false);
@@ -504,16 +520,20 @@ mod test {
 
     #[test]
     fn test_vote_after_deadline_returns_error() {
-        let (env, _admin, user, client, _vault_id, _prop_id) = setup();
+        let (env, _admin, user, client, vault_id, prop_id) = setup();
+
+        let vault_client = FractionVaultClient::new(&env, &vault_id);
+        give_voting_power(&env, &vault_client, &vault_id, prop_id, &user, 10);
 
         let calldata = Bytes::from_array(&env, &[]);
         let description = String::from_str(&env, "Test");
-        let proposal_id = client.propose(&1u32, &calldata, &description);
+        let proposal_id = client.propose(&user, &1u32, &calldata, &description);
 
         env.ledger()
             .set_timestamp(env.ledger().timestamp() + VOTING_PERIOD + 1);
 
-        let result = client.try_vote(&user, &proposal_id, &true);
+        let other = Address::generate(&env);
+        let result = client.try_vote(&other, &proposal_id, &true);
         assert!(result.is_err());
     }
 
@@ -521,19 +541,12 @@ mod test {
     fn test_execute_after_timelock() {
         let (env, _admin, user, client, vault_id, prop_id) = setup();
 
+        let vault_client = FractionVaultClient::new(&env, &vault_id);
+        give_voting_power(&env, &vault_client, &vault_id, prop_id, &user, 100);
+
         let calldata = Bytes::from_array(&env, &[]);
         let description = String::from_str(&env, "Test execution");
-        let proposal_id = client.propose(&1u32, &calldata, &description);
-
-        let vault_client = FractionVaultClient::new(&env, &vault_id);
-        let info = vault_client.get_fraction_info(&prop_id);
-        let compliance_client = ComplianceRegistryClient::new(&env, &info.4);
-        let proof = soroban_sdk::Bytes::from_slice(&env, b"proof");
-        compliance_client.attest(&user, &proof, &symbol_short!("US"), &365u32);
-
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &info.2);
-        sac.mint(&user, &100_000i128);
-        vault_client.buy_fraction(&user, &prop_id, &100u128);
+        let proposal_id = client.propose(&user, &1u32, &calldata, &description);
 
         client.vote(&user, &proposal_id, &true);
 
@@ -550,19 +563,12 @@ mod test {
     fn test_execute_before_voting_ends_returns_error() {
         let (env, _admin, user, client, vault_id, prop_id) = setup();
 
+        let vault_client = FractionVaultClient::new(&env, &vault_id);
+        give_voting_power(&env, &vault_client, &vault_id, prop_id, &user, 100);
+
         let calldata = Bytes::from_array(&env, &[]);
         let description = String::from_str(&env, "Test");
-        let proposal_id = client.propose(&1u32, &calldata, &description);
-
-        let vault_client = FractionVaultClient::new(&env, &vault_id);
-        let info = vault_client.get_fraction_info(&prop_id);
-        let compliance_client = ComplianceRegistryClient::new(&env, &info.4);
-        let proof = soroban_sdk::Bytes::from_slice(&env, b"proof");
-        compliance_client.attest(&user, &proof, &symbol_short!("US"), &365u32);
-
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &info.2);
-        sac.mint(&user, &100_000i128);
-        vault_client.buy_fraction(&user, &prop_id, &100u128);
+        let proposal_id = client.propose(&user, &1u32, &calldata, &description);
 
         client.vote(&user, &proposal_id, &true);
         let result = client.try_execute(&proposal_id);
@@ -571,13 +577,30 @@ mod test {
 
     #[test]
     fn test_vote_without_power_returns_error() {
+        let (env, _admin, user, client, vault_id, prop_id) = setup();
+
+        // proposer needs power; user (the proposer) gets it
+        let vault_client = FractionVaultClient::new(&env, &vault_id);
+        give_voting_power(&env, &vault_client, &vault_id, prop_id, &user, 10);
+
+        let calldata = Bytes::from_array(&env, &[]);
+        let description = String::from_str(&env, "Test");
+        let proposal_id = client.propose(&user, &1u32, &calldata, &description);
+
+        // powerless voter should be rejected
+        let no_power = Address::generate(&env);
+        let result = client.try_vote(&no_power, &proposal_id, &true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_propose_without_power_returns_error() {
         let (env, _admin, user, client, _vault_id, _prop_id) = setup();
 
         let calldata = Bytes::from_array(&env, &[]);
         let description = String::from_str(&env, "Test");
-        let proposal_id = client.propose(&1u32, &calldata, &description);
-
-        let result = client.try_vote(&user, &proposal_id, &true);
+        // user has no fractions → should fail
+        let result = client.try_propose(&user, &1u32, &calldata, &description);
         assert!(result.is_err());
     }
 
@@ -608,19 +631,12 @@ mod test {
     fn test_full_proposal_lifecycle() {
         let (env, _admin, user, client, vault_id, prop_id) = setup();
 
+        let vault_client = FractionVaultClient::new(&env, &vault_id);
+        give_voting_power(&env, &vault_client, &vault_id, prop_id, &user, 200);
+
         let calldata = Bytes::from_array(&env, &[0x01, 0x02]);
         let description = String::from_str(&env, "Update LTV parameter");
-        let proposal_id = client.propose(&1u32, &calldata, &description);
-
-        let vault_client = FractionVaultClient::new(&env, &vault_id);
-        let info = vault_client.get_fraction_info(&prop_id);
-        let compliance_client = ComplianceRegistryClient::new(&env, &info.4);
-        let proof = soroban_sdk::Bytes::from_slice(&env, b"proof");
-        compliance_client.attest(&user, &proof, &symbol_short!("US"), &365u32);
-
-        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &info.2);
-        sac.mint(&user, &200_000i128);
-        vault_client.buy_fraction(&user, &prop_id, &200u128);
+        let proposal_id = client.propose(&user, &1u32, &calldata, &description);
 
         client.vote(&user, &proposal_id, &true);
         let proposal = client.get_proposal(&proposal_id);
