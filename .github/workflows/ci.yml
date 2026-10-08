@@ -44,7 +44,9 @@ jobs:
           components: clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace -- -D warnings
+      # integration_tests uses soroban testutils which are only available as
+      # dev-dependencies; clippy on the lib target fails without them.
+      - run: cargo clippy --workspace --exclude propfi-integration-tests -- -D warnings
 
   fmt:
     name: Format
@@ -64,7 +66,7 @@ jobs:
         working-directory: indexer
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm

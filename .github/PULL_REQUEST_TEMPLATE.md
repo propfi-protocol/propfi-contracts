@@ -16,8 +16,9 @@ Fixes # (issue)
 <!-- Please describe the tests that you ran to verify your changes -->
 
 - [ ] Unit tests (`cargo test --workspace`)
-- [ ] Integration tests (`cd tests/integration && npm test`)
-- [ ] Linting (`cargo clippy` and `npm run lint`)
+- [ ] Integration tests (`cargo test -p propfi-integration-tests`)
+- [ ] Linting (`cargo clippy --workspace --exclude propfi-integration-tests -- -D warnings`)
+- [ ] Formatting (`cargo fmt --all --check`)
 
 ## Checklist
 - [ ] My code follows the style guidelines of this project

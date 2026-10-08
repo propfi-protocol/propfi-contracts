@@ -61,7 +61,7 @@ test-integration:
 lint: lint-contracts lint-frontend lint-sdk lint-indexer
 
 lint-contracts:
-	cargo clippy --workspace -- -D warnings
+	cargo clippy --workspace --exclude propfi-integration-tests -- -D warnings
 
 lint-frontend:
 	cd frontend && npm run lint

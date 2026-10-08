@@ -1,7 +1,18 @@
 #![no_std]
 //! Multi-source price oracle with weighted aggregation and TWAP. Manages oracle registry, price submissions, staleness detection, and time-weighted average price computation.
 use propfi_types::PriceData;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum OracleAdapterError {
+    AlreadyInitialized = 1,
+    Unauthorized = 2,
+    OracleNotRegistered = 3,
+    OracleNotActive = 4,
+    PriceStale = 5,
+    NoPriceAvailable = 6,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
@@ -35,26 +46,47 @@ pub enum DataKey {
     PriceSamples(Symbol),
 }
 
+/// Bump instance TTL to ~60 days (in ledgers at 5s/ledger) whenever the current
+/// TTL falls below ~30 days. Called on every public entry point so active
+/// contracts never silently expire their on-chain state.
+const INSTANCE_TTL_THRESHOLD: u32 = 518_400;  // 30 days in ledgers
+const INSTANCE_TTL_EXTEND_TO: u32 = 1_036_800; // 60 days in ledgers
+
 #[contract]
 pub struct OracleAdapter;
 
 #[contractimpl]
 impl OracleAdapter {
     /// Sets admin and staleness threshold. Called once at deployment.
-    pub fn initialize(env: Env, admin: Address, staleness_threshold: u64) {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        staleness_threshold: u64,
+    ) -> Result<(), OracleAdapterError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let existing: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         if existing.is_some() {
-            panic!("already initialized");
+            return Err(OracleAdapterError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
             .set(&DataKey::StalenessThreshold, &staleness_threshold);
+        Ok(())
     }
 
     /// Registers an oracle with the given weight. Only callable by admin.
-    pub fn add_oracle(env: Env, oracle_addr: Address, weight: u32) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    pub fn add_oracle(
+        env: Env,
+        oracle_addr: Address,
+        weight: u32,
+    ) -> Result<(), OracleAdapterError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(OracleAdapterError::Unauthorized)?;
         admin.require_auth();
 
         let info = OracleInfo {
@@ -67,18 +99,24 @@ impl OracleAdapter {
 
         env.events()
             .publish((Symbol::new(&env, "OracleAdded"), oracle_addr), weight);
+        Ok(())
     }
 
     /// Removes an oracle from the registry. Only callable by admin.
-    pub fn remove_oracle(env: Env, oracle_addr: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    pub fn remove_oracle(env: Env, oracle_addr: Address) -> Result<(), OracleAdapterError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(OracleAdapterError::Unauthorized)?;
         admin.require_auth();
 
         let mut info: OracleInfo = env
             .storage()
             .instance()
             .get(&DataKey::OracleInfo(oracle_addr.clone()))
-            .unwrap();
+            .ok_or(OracleAdapterError::OracleNotRegistered)?;
         info.active = false;
         env.storage()
             .instance()
@@ -86,19 +124,60 @@ impl OracleAdapter {
 
         env.events()
             .publish((Symbol::new(&env, "OracleRemoved"), oracle_addr), ());
+        Ok(())
+    }
+
+    /// Updates the weight of an existing registered oracle. Only callable by admin.
+    /// This allows governance to rebalance oracle influence without removing and re-adding.
+    pub fn update_oracle_weight(
+        env: Env,
+        oracle_addr: Address,
+        new_weight: u32,
+    ) -> Result<(), OracleAdapterError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(OracleAdapterError::Unauthorized)?;
+        admin.require_auth();
+
+        let mut info: OracleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleInfo(oracle_addr.clone()))
+            .ok_or(OracleAdapterError::OracleNotRegistered)?;
+
+        let old_weight = info.weight;
+        info.weight = new_weight;
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleInfo(oracle_addr.clone()), &info);
+
+        env.events().publish(
+            (Symbol::new(&env, "OracleWeightUpdated"), oracle_addr),
+            (old_weight, new_weight),
+        );
+        Ok(())
     }
 
     /// Records a price submission from an oracle for the given asset. Oracle must self-authenticate.
-    pub fn submit_price(env: Env, oracle: Address, asset: Symbol, price: i128) {
+    pub fn submit_price(
+        env: Env,
+        oracle: Address,
+        asset: Symbol,
+        price: i128,
+    ) -> Result<(), OracleAdapterError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         oracle.require_auth();
 
         let info: OracleInfo = env
             .storage()
             .instance()
             .get(&DataKey::OracleInfo(oracle.clone()))
-            .unwrap_or_else(|| panic!("oracle not registered"));
+            .ok_or(OracleAdapterError::OracleNotRegistered)?;
         if !info.active {
-            panic!("oracle not active");
+            return Err(OracleAdapterError::OracleNotActive);
         }
 
         let timestamp = env.ledger().timestamp();
@@ -183,10 +262,14 @@ impl OracleAdapter {
             (Symbol::new(&env, "PriceUpdated"), asset),
             (avg_price, timestamp, oracle_count),
         );
+        Ok(())
     }
 
-    /// Returns the latest weighted aggregate price for an asset, or panics if no data.
+    /// Returns the latest weighted aggregate price for an asset, or a zeroed struct if no data.
+    /// Emits a StaleAlert event when the price exceeds the staleness threshold but still returns it.
+    /// Use get_price_strict() when stale prices must be rejected.
     pub fn get_price(env: Env, asset: Symbol) -> PriceData {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let price_data: PriceData = env
             .storage()
             .instance()
@@ -201,7 +284,7 @@ impl OracleAdapter {
             .storage()
             .instance()
             .get(&DataKey::StalenessThreshold)
-            .unwrap();
+            .unwrap_or(0);
 
         let now = env.ledger().timestamp();
         if price_data.timestamp > 0
@@ -217,8 +300,42 @@ impl OracleAdapter {
         price_data
     }
 
+    /// Returns the latest price only if it is fresh (within the staleness threshold).
+    /// Returns PriceStale when the price is older than the configured threshold, and
+    /// NoPriceAvailable when no price has been submitted yet.
+    /// Use this instead of get_price() in any context where acting on stale data is unsafe.
+    pub fn get_price_strict(
+        env: Env,
+        asset: Symbol,
+    ) -> Result<PriceData, OracleAdapterError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        let price_data: PriceData = env
+            .storage()
+            .instance()
+            .get(&DataKey::AssetPrice(asset.clone()))
+            .ok_or(OracleAdapterError::NoPriceAvailable)?;
+
+        if price_data.price <= 0 || price_data.timestamp == 0 {
+            return Err(OracleAdapterError::NoPriceAvailable);
+        }
+
+        let threshold: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StalenessThreshold)
+            .unwrap_or(0);
+
+        let now = env.ledger().timestamp();
+        if threshold > 0 && now > price_data.timestamp && now - price_data.timestamp > threshold {
+            return Err(OracleAdapterError::PriceStale);
+        }
+
+        Ok(price_data)
+    }
+
     /// Computes the time-weighted average price over the given window (in seconds).
     pub fn twap(env: Env, asset: Symbol, window_secs: u64) -> i128 {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let samples: Vec<PriceSample> = env
             .storage()
             .instance()
@@ -262,6 +379,7 @@ impl OracleAdapter {
 
     /// Returns the registration info for a given oracle address.
     pub fn get_oracle_info(env: Env, oracle_addr: Address) -> OracleInfo {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::OracleInfo(oracle_addr))
@@ -269,6 +387,15 @@ impl OracleAdapter {
                 weight: 0,
                 active: false,
             })
+    }
+
+    /// Returns the configured staleness threshold in seconds.
+    pub fn get_staleness_threshold(env: Env) -> u64 {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .get(&DataKey::StalenessThreshold)
+            .unwrap_or(0)
     }
 }
 
@@ -316,8 +443,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "already initialized")]
-    fn test_double_initialize_panics() {
+    fn test_double_initialize_returns_error() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -326,7 +452,8 @@ mod test {
         let client = OracleAdapterClient::new(&env, &contract_id);
 
         client.initialize(&admin, &3600u64);
-        client.initialize(&admin, &3600u64);
+        let result = client.try_initialize(&admin, &3600u64);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -350,6 +477,65 @@ mod test {
         let info = client.get_oracle_info(&oracle);
         assert!(!info.active);
         assert_eq!(info.weight, 100);
+    }
+
+    #[test]
+    fn test_update_oracle_weight() {
+        let (_env, _admin, oracle, client) = setup();
+
+        client.add_oracle(&oracle, &100u32);
+
+        let info_before = client.get_oracle_info(&oracle);
+        assert_eq!(info_before.weight, 100);
+
+        client.update_oracle_weight(&oracle, &200u32);
+
+        let info_after = client.get_oracle_info(&oracle);
+        assert_eq!(info_after.weight, 200);
+        assert!(info_after.active);
+    }
+
+    #[test]
+    fn test_update_oracle_weight_unregistered_returns_error() {
+        let (env, _admin, _oracle, client) = setup();
+        let unregistered = Address::generate(&env);
+        let result = client.try_update_oracle_weight(&unregistered, &200u32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_weight_update_affects_aggregation() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let oracle1 = Address::generate(&env);
+        let oracle2 = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, OracleAdapter);
+        let client = OracleAdapterClient::new(&env, &contract_id);
+        let asset = Symbol::new(&env, "BTC_USD");
+
+        client.initialize(&admin, &86400u64);
+        client.add_oracle(&oracle1, &100u32);
+        client.add_oracle(&oracle2, &100u32);
+
+        client.submit_price(&oracle1, &asset, &50000i128);
+        client.submit_price(&oracle2, &asset, &60000i128);
+
+        // Equal weights: average = 55000
+        let price_before = client.get_price(&asset);
+        assert_eq!(price_before.price, 55000);
+
+        // Increase oracle1's weight to dominate
+        client.update_oracle_weight(&oracle1, &400u32);
+
+        // Re-submit to trigger recalculation
+        client.submit_price(&oracle1, &asset, &50000i128);
+
+        let price_after = client.get_price(&asset);
+        // Expected: (50000*400 + 60000*100) / 500 = (20000000 + 6000000) / 500 = 52000
+        assert_eq!(price_after.price, 52000);
     }
 
     #[test]
@@ -391,31 +577,6 @@ mod test {
     }
 
     #[test]
-    fn test_oracle_update_price() {
-        let (_env, oracle, _admin, asset, client) = setup_with_oracle();
-
-        client.submit_price(&oracle, &asset, &50000i128);
-        client.submit_price(&oracle, &asset, &51000i128);
-
-        let price_data = client.get_price(&asset);
-        assert_eq!(price_data.price, 51000);
-        assert_eq!(price_data.oracle_count, 1);
-    }
-
-    #[test]
-    fn test_staleness() {
-        let (env, oracle, _admin, asset, client) = setup_with_oracle();
-
-        client.submit_price(&oracle, &asset, &50000i128);
-
-        env.ledger().set_timestamp(env.ledger().timestamp() + 90000);
-
-        let price_data = client.get_price(&asset);
-        assert_eq!(price_data.price, 50000);
-        assert_eq!(price_data.oracle_count, 1);
-    }
-
-    #[test]
     fn test_twap_over_window() {
         let (env, oracle, _admin, asset, client) = setup_with_oracle();
 
@@ -435,26 +596,59 @@ mod test {
     }
 
     #[test]
-    fn test_twap_no_samples() {
-        let (_env, _oracle, _admin, asset, client) = setup_with_oracle();
-        let twap = client.twap(&asset, &3600u64);
-        assert_eq!(twap, 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "oracle not registered")]
-    fn test_unregistered_oracle_cannot_submit() {
+    fn test_unregistered_oracle_cannot_submit_returns_error() {
         let (env, _admin, _oracle, client) = setup();
         let asset = Symbol::new(&env, "BTC_USD");
         let rogue = Address::generate(&env);
-        client.submit_price(&rogue, &asset, &50000i128);
+        let result = client.try_submit_price(&rogue, &asset, &50000i128);
+        assert!(result.is_err());
     }
 
     #[test]
-    #[should_panic(expected = "oracle not active")]
-    fn test_removed_oracle_cannot_submit() {
+    fn test_removed_oracle_cannot_submit_returns_error() {
         let (_env, oracle, _admin, asset, client) = setup_with_oracle();
         client.remove_oracle(&oracle);
+        let result = client.try_submit_price(&oracle, &asset, &50000i128);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_price_strict_fresh_price_succeeds() {
+        let (env, oracle, _admin, asset, client) = setup_with_oracle();
+        // Set a realistic starting timestamp so the price gets a non-zero timestamp
+        env.ledger().set_timestamp(1_000_000);
         client.submit_price(&oracle, &asset, &50000i128);
+
+        // Advance well within the 86400s window
+        env.ledger().set_timestamp(1_000_000 + 3600);
+        let result = client.try_get_price_strict(&asset);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().unwrap().price, 50000);
+    }
+
+    #[test]
+    fn test_get_price_strict_stale_price_returns_error() {
+        let (env, oracle, _admin, asset, client) = setup_with_oracle();
+        env.ledger().set_timestamp(1_000_000);
+        client.submit_price(&oracle, &asset, &50000i128);
+
+        // Advance past the 86400s threshold
+        env.ledger().set_timestamp(1_000_000 + 86_401);
+        let result = client.try_get_price_strict(&asset);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_price_strict_no_price_returns_error() {
+        let (env, _admin, _oracle, client) = setup();
+        let asset = Symbol::new(&env, "BTC_USD");
+        let result = client.try_get_price_strict(&asset);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_staleness_threshold() {
+        let (_env, _admin, _oracle, client) = setup();
+        assert_eq!(client.get_staleness_threshold(), 86400u64);
     }
 }

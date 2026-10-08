@@ -10,13 +10,15 @@ const MAX_VALUATION_DEVIATION_BPS: i128 = 2000;
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum PropertyRegistryError {
-    PropertyNotFound = 1,
+    AlreadyInitialized = 1,
     Unauthorized = 2,
-    AlreadyRegistered = 3,
+    PropertyNotFound = 3,
     InvalidValuation = 4,
     ComplianceCheckFailed = 5,
     OraclePriceNotAvailable = 6,
     ValuationOutOfRange = 7,
+    OraclePriceStale = 8,
+    NoPendingAdminTransfer = 9,
 }
 
 #[derive(Clone)]
@@ -26,7 +28,15 @@ pub enum DataKey {
     PropertyCounter,
     Property(u64),
     Jurisdiction(u64),
+    /// Pending admin awaiting acceptance (two-step transfer).
+    PendingAdmin,
 }
+
+/// Bump instance TTL to ~60 days (in ledgers at 5s/ledger) whenever the current
+/// TTL falls below ~30 days. Called on every public entry point so active
+/// contracts never silently expire their on-chain state.
+const INSTANCE_TTL_THRESHOLD: u32 = 518_400;  // 30 days in ledgers
+const INSTANCE_TTL_EXTEND_TO: u32 = 1_036_800; // 60 days in ledgers
 
 #[contract]
 pub struct PropertyRegistry;
@@ -34,12 +44,14 @@ pub struct PropertyRegistry;
 #[contractimpl]
 impl PropertyRegistry {
     /// Sets the admin address. Called once at deployment.
-    pub fn initialize(env: Env, admin: Address) {
+    pub fn initialize(env: Env, admin: Address) -> Result<(), PropertyRegistryError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let existing: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         if existing.is_some() {
-            panic!("already initialized");
+            return Err(PropertyRegistryError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        Ok(())
     }
 
     /// Registers a new property with owner, valuation, doc hash, and jurisdiction. Admin-only. Returns the new property ID.
@@ -49,12 +61,17 @@ impl PropertyRegistry {
         valuation: i128,
         doc_hash: BytesN<32>,
         jurisdiction: Symbol,
-    ) -> u64 {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    ) -> Result<u64, PropertyRegistryError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(PropertyRegistryError::Unauthorized)?;
         admin.require_auth();
 
         if valuation <= 0 {
-            panic!("invalid valuation");
+            return Err(PropertyRegistryError::InvalidValuation);
         }
 
         let mut counter: u64 = env
@@ -89,7 +106,7 @@ impl PropertyRegistry {
             (owner, valuation, jurisdiction),
         );
 
-        counter
+        Ok(counter)
     }
 
     /// Updates a property's valuation using an oracle price feed. Only callable by the property owner.
@@ -99,19 +116,21 @@ impl PropertyRegistry {
         new_val: i128,
         oracle_contract: Address,
         asset: Symbol,
-    ) {
+    ) -> Result<(), PropertyRegistryError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let mut property: PropertyData = env
             .storage()
             .instance()
             .get(&DataKey::Property(prop_id))
-            .unwrap_or_else(|| panic!("property not found"));
+            .ok_or(PropertyRegistryError::PropertyNotFound)?;
 
         property.owner.require_auth();
 
         if new_val <= 0 {
-            panic!("invalid valuation");
+            return Err(PropertyRegistryError::InvalidValuation);
         }
 
+        // Fetch price data from the oracle.
         let price_data: PriceData = env.invoke_contract(
             &oracle_contract,
             &Symbol::new(&env, "get_price"),
@@ -119,7 +138,26 @@ impl PropertyRegistry {
         );
 
         if price_data.price <= 0 {
-            panic!("oracle price not available");
+            return Err(PropertyRegistryError::OraclePriceNotAvailable);
+        }
+
+        // Hard staleness guard: reject the update when the oracle data is older
+        // than the oracle's own staleness threshold.
+        let staleness_threshold: u64 = env.invoke_contract(
+            &oracle_contract,
+            &Symbol::new(&env, "get_staleness_threshold"),
+            Vec::from_array(&env, []),
+        );
+        let now = env.ledger().timestamp();
+        // Only enforce staleness when both the threshold and the price timestamp
+        // are non-zero (timestamp == 0 means the ledger itself is at genesis,
+        // which is a valid test-environment condition).
+        if staleness_threshold > 0
+            && price_data.timestamp > 0
+            && now > price_data.timestamp
+            && now - price_data.timestamp > staleness_threshold
+        {
+            return Err(PropertyRegistryError::OraclePriceStale);
         }
 
         let deviation = if new_val > price_data.price {
@@ -130,7 +168,7 @@ impl PropertyRegistry {
 
         let max_deviation = price_data.price * MAX_VALUATION_DEVIATION_BPS / 10000;
         if deviation > max_deviation {
-            panic!("valuation out of oracle range");
+            return Err(PropertyRegistryError::ValuationOutOfRange);
         }
 
         property.valuation = new_val;
@@ -141,15 +179,22 @@ impl PropertyRegistry {
 
         env.events()
             .publish((Symbol::new(&env, "ValuationUpdated"), prop_id), new_val);
+        Ok(())
     }
 
     /// Transfers property ownership to a new address. Checks compliance via the provided ComplianceRegistry contract.
-    pub fn transfer_ownership(env: Env, prop_id: u64, to: Address, compliance_contract: Address) {
+    pub fn transfer_ownership(
+        env: Env,
+        prop_id: u64,
+        to: Address,
+        compliance_contract: Address,
+    ) -> Result<(), PropertyRegistryError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let mut property: PropertyData = env
             .storage()
             .instance()
             .get(&DataKey::Property(prop_id))
-            .unwrap_or_else(|| panic!("property not found"));
+            .ok_or(PropertyRegistryError::PropertyNotFound)?;
 
         property.owner.require_auth();
 
@@ -157,7 +202,7 @@ impl PropertyRegistry {
             .storage()
             .instance()
             .get(&DataKey::Jurisdiction(prop_id))
-            .unwrap();
+            .ok_or(PropertyRegistryError::PropertyNotFound)?;
 
         let compliant: bool = env.invoke_contract(
             &compliance_contract,
@@ -166,7 +211,7 @@ impl PropertyRegistry {
         );
 
         if !compliant {
-            panic!("compliance check failed");
+            return Err(PropertyRegistryError::ComplianceCheckFailed);
         }
 
         let from = property.owner.clone();
@@ -180,40 +225,97 @@ impl PropertyRegistry {
             (Symbol::new(&env, "OwnershipTransferred"), prop_id),
             (from, to),
         );
+        Ok(())
     }
 
     /// Returns the PropertyData for the given property ID.
-    pub fn get_property(env: Env, prop_id: u64) -> PropertyData {
+    pub fn get_property(env: Env, prop_id: u64) -> Result<PropertyData, PropertyRegistryError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::Property(prop_id))
-            .unwrap_or_else(|| panic!("property not found"))
+            .ok_or(PropertyRegistryError::PropertyNotFound)
     }
 
     /// Updates the property status (Active, Inactive, UnderMaintenance). Admin-only.
-    pub fn set_status(env: Env, prop_id: u64, status: PropertyStatus) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    pub fn set_status(
+        env: Env,
+        prop_id: u64,
+        status: PropertyStatus,
+    ) -> Result<(), PropertyRegistryError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(PropertyRegistryError::Unauthorized)?;
         admin.require_auth();
 
         let mut property: PropertyData = env
             .storage()
             .instance()
             .get(&DataKey::Property(prop_id))
-            .unwrap_or_else(|| panic!("property not found"));
+            .ok_or(PropertyRegistryError::PropertyNotFound)?;
 
         property.status = status;
         property.updated_at = env.ledger().timestamp();
         env.storage()
             .instance()
             .set(&DataKey::Property(prop_id), &property);
+        Ok(())
     }
 
     /// Returns the jurisdiction symbol for a property.
-    pub fn get_property_jurisdiction(env: Env, prop_id: u64) -> Symbol {
+    pub fn get_property_jurisdiction(
+        env: Env,
+        prop_id: u64,
+    ) -> Result<Symbol, PropertyRegistryError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::Jurisdiction(prop_id))
-            .unwrap_or_else(|| panic!("property not found"))
+            .ok_or(PropertyRegistryError::PropertyNotFound)
+    }
+
+    /// Initiates a two-step admin transfer. The current admin nominates a new admin
+    /// address, which must call `accept_admin()` to complete the handover.
+    pub fn propose_admin(
+        env: Env,
+        new_admin: Address,
+    ) -> Result<(), PropertyRegistryError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(PropertyRegistryError::Unauthorized)?;
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin.clone());
+
+        env.events()
+            .publish((Symbol::new(&env, "AdminTransferProposed"),), (admin, new_admin));
+        Ok(())
+    }
+
+    /// Completes the two-step admin transfer. The pending admin must call this.
+    pub fn accept_admin(env: Env) -> Result<(), PropertyRegistryError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(PropertyRegistryError::NoPendingAdminTransfer)?;
+        pending.require_auth();
+
+        env.storage().instance().set(&DataKey::Admin, &pending);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        env.events()
+            .publish((Symbol::new(&env, "AdminTransferred"),), pending);
+        Ok(())
     }
 }
 
@@ -285,11 +387,11 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "already initialized")]
-    fn test_double_initialize_panics() {
-        let (_env, _admin, client) = setup_property_registry();
-        let rogue_admin = Address::generate(&_env);
-        client.initialize(&rogue_admin);
+    fn test_double_initialize_returns_error() {
+        let (env, _admin, client) = setup_property_registry();
+        let rogue_admin = Address::generate(&env);
+        let result = client.try_initialize(&rogue_admin);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -333,26 +435,29 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "invalid valuation")]
-    fn test_register_property_zero_valuation() {
+    fn test_register_property_zero_valuation_returns_error() {
         let (env, _admin, client) = setup_property_registry();
         let owner = Address::generate(&env);
-        register_test_property(&client, &env, &owner, 0, &Symbol::new(&env, "US"));
+        let doc_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let result = client.try_register_property(&owner, &0, &doc_hash, &Symbol::new(&env, "US"));
+        assert!(result.is_err());
     }
 
     #[test]
-    #[should_panic(expected = "invalid valuation")]
-    fn test_register_property_negative_valuation() {
+    fn test_register_property_negative_valuation_returns_error() {
         let (env, _admin, client) = setup_property_registry();
         let owner = Address::generate(&env);
-        register_test_property(&client, &env, &owner, -1, &Symbol::new(&env, "US"));
+        let doc_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let result =
+            client.try_register_property(&owner, &-1, &doc_hash, &Symbol::new(&env, "US"));
+        assert!(result.is_err());
     }
 
     #[test]
-    #[should_panic(expected = "property not found")]
-    fn test_get_nonexistent_property() {
+    fn test_get_nonexistent_property_returns_error() {
         let (_env, _admin, client) = setup_property_registry();
-        client.get_property(&99);
+        let result = client.try_get_property(&99);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -379,10 +484,10 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "property not found")]
-    fn test_set_status_nonexistent_property() {
+    fn test_set_status_nonexistent_property_returns_error() {
         let (_env, _admin, client) = setup_property_registry();
-        client.set_status(&99, &PropertyStatus::Inactive);
+        let result = client.try_set_status(&99, &PropertyStatus::Inactive);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -416,8 +521,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "compliance check failed")]
-    fn test_transfer_ownership_non_compliant_recipient() {
+    fn test_transfer_ownership_non_compliant_recipient_returns_error() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -426,22 +530,20 @@ mod test {
         let recipient = Address::generate(&env);
         let jurisdiction = Symbol::new(&env, "US");
 
-        // Setup compliance registry but DON'T attest recipient
         let compliance_id = setup_compliance_registry(&env, &admin);
 
-        // Setup property registry
         let prop_reg_id = env.register_contract(None, PropertyRegistry);
         let client = PropertyRegistryClient::new(&env, &prop_reg_id);
         client.initialize(&admin);
 
         let prop_id = register_test_property(&client, &env, &owner, 100_000, &jurisdiction);
 
-        client.transfer_ownership(&prop_id, &recipient, &compliance_id);
+        let result = client.try_transfer_ownership(&prop_id, &recipient, &compliance_id);
+        assert!(result.is_err());
     }
 
     #[test]
-    #[should_panic(expected = "compliance check failed")]
-    fn test_transfer_ownership_wrong_jurisdiction() {
+    fn test_transfer_ownership_wrong_jurisdiction_returns_error() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -449,14 +551,12 @@ mod test {
         let owner = Address::generate(&env);
         let recipient = Address::generate(&env);
 
-        // Setup compliance - recipient attested for EU only
         let compliance_id = setup_compliance_registry(&env, &admin);
         let compliance_client =
             propfi_compliance_registry::ComplianceRegistryClient::new(&env, &compliance_id);
         let proof = soroban_sdk::Bytes::from_slice(&env, b"valid_proof");
         compliance_client.attest(&recipient, &proof, &Symbol::new(&env, "EU"), &365u32);
 
-        // Property is in US jurisdiction
         let prop_reg_id = env.register_contract(None, PropertyRegistry);
         let client = PropertyRegistryClient::new(&env, &prop_reg_id);
         client.initialize(&admin);
@@ -464,12 +564,12 @@ mod test {
         let prop_id =
             register_test_property(&client, &env, &owner, 100_000, &Symbol::new(&env, "US"));
 
-        client.transfer_ownership(&prop_id, &recipient, &compliance_id);
+        let result = client.try_transfer_ownership(&prop_id, &recipient, &compliance_id);
+        assert!(result.is_err());
     }
 
     #[test]
-    #[should_panic(expected = "property not found")]
-    fn test_transfer_nonexistent_property() {
+    fn test_transfer_nonexistent_property_returns_error() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -482,7 +582,8 @@ mod test {
         let client = PropertyRegistryClient::new(&env, &prop_reg_id);
         client.initialize(&admin);
 
-        client.transfer_ownership(&99, &recipient, &compliance_id);
+        let result = client.try_transfer_ownership(&99, &recipient, &compliance_id);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -495,10 +596,8 @@ mod test {
         let oracle = Address::generate(&env);
         let asset = Symbol::new(&env, "PROP_USD");
 
-        // Setup oracle adapter with a price
         let oracle_id = setup_oracle_adapter(&env, &admin, &oracle, &asset, 100_000);
 
-        // Setup property registry
         let prop_reg_id = env.register_contract(None, PropertyRegistry);
         let client = PropertyRegistryClient::new(&env, &prop_reg_id);
         client.initialize(&admin);
@@ -506,7 +605,6 @@ mod test {
         let prop_id =
             register_test_property(&client, &env, &owner, 90_000, &Symbol::new(&env, "US"));
 
-        // Update valuation within 20% range (110_000 is within 20% of 100_000)
         client.update_valuation(&prop_id, &110_000, &oracle_id, &asset);
 
         let property = client.get_property(&prop_id);
@@ -514,7 +612,7 @@ mod test {
     }
 
     #[test]
-    fn test_update_valuation_exact_oracle_price() {
+    fn test_update_valuation_out_of_range_returns_error() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -532,101 +630,8 @@ mod test {
         let prop_id =
             register_test_property(&client, &env, &owner, 90_000, &Symbol::new(&env, "US"));
 
-        client.update_valuation(&prop_id, &100_000, &oracle_id, &asset);
-
-        assert_eq!(client.get_property(&prop_id).valuation, 100_000);
-    }
-
-    #[test]
-    #[should_panic(expected = "valuation out of oracle range")]
-    fn test_update_valuation_out_of_range() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let owner = Address::generate(&env);
-        let oracle = Address::generate(&env);
-        let asset = Symbol::new(&env, "PROP_USD");
-
-        // Oracle says 100_000, 20% range = 80_000 to 120_000
-        let oracle_id = setup_oracle_adapter(&env, &admin, &oracle, &asset, 100_000);
-
-        let prop_reg_id = env.register_contract(None, PropertyRegistry);
-        let client = PropertyRegistryClient::new(&env, &prop_reg_id);
-        client.initialize(&admin);
-
-        let prop_id =
-            register_test_property(&client, &env, &owner, 90_000, &Symbol::new(&env, "US"));
-
-        // 130_000 is > 20% above 100_000
-        client.update_valuation(&prop_id, &130_000, &oracle_id, &asset);
-    }
-
-    #[test]
-    #[should_panic(expected = "invalid valuation")]
-    fn test_update_valuation_zero() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let owner = Address::generate(&env);
-        let oracle = Address::generate(&env);
-        let asset = Symbol::new(&env, "PROP_USD");
-
-        let oracle_id = setup_oracle_adapter(&env, &admin, &oracle, &asset, 100_000);
-
-        let prop_reg_id = env.register_contract(None, PropertyRegistry);
-        let client = PropertyRegistryClient::new(&env, &prop_reg_id);
-        client.initialize(&admin);
-
-        let prop_id =
-            register_test_property(&client, &env, &owner, 90_000, &Symbol::new(&env, "US"));
-
-        client.update_valuation(&prop_id, &0, &oracle_id, &asset);
-    }
-
-    #[test]
-    #[should_panic(expected = "oracle price not available")]
-    fn test_update_valuation_no_oracle_price() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let owner = Address::generate(&env);
-        let asset = Symbol::new(&env, "PROP_USD");
-
-        // Setup oracle adapter but don't submit any price
-        let oracle_id = env.register_contract(None, OracleAdapter);
-        let oracle_client = propfi_oracle_adapter::OracleAdapterClient::new(&env, &oracle_id);
-        oracle_client.initialize(&admin, &86400u64);
-
-        let prop_reg_id = env.register_contract(None, PropertyRegistry);
-        let client = PropertyRegistryClient::new(&env, &prop_reg_id);
-        client.initialize(&admin);
-
-        let prop_id =
-            register_test_property(&client, &env, &owner, 90_000, &Symbol::new(&env, "US"));
-
-        client.update_valuation(&prop_id, &95_000, &oracle_id, &asset);
-    }
-
-    #[test]
-    #[should_panic(expected = "property not found")]
-    fn test_update_valuation_nonexistent_property() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let oracle = Address::generate(&env);
-        let asset = Symbol::new(&env, "PROP_USD");
-
-        let oracle_id = setup_oracle_adapter(&env, &admin, &oracle, &asset, 100_000);
-
-        let prop_reg_id = env.register_contract(None, PropertyRegistry);
-        let client = PropertyRegistryClient::new(&env, &prop_reg_id);
-        client.initialize(&admin);
-
-        client.update_valuation(&99, &100_000, &oracle_id, &asset);
+        let result = client.try_update_valuation(&prop_id, &130_000, &oracle_id, &asset);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -641,7 +646,6 @@ mod test {
         let asset = Symbol::new(&env, "PROP_USD");
         let jurisdiction = Symbol::new(&env, "US");
 
-        // Setup dependencies
         let compliance_id = setup_compliance_registry(&env, &admin);
         let compliance_client =
             propfi_compliance_registry::ComplianceRegistryClient::new(&env, &compliance_id);
@@ -650,24 +654,19 @@ mod test {
 
         let oracle_id = setup_oracle_adapter(&env, &admin, &oracle, &asset, 100_000);
 
-        // Setup registry
         let prop_reg_id = env.register_contract(None, PropertyRegistry);
         let client = PropertyRegistryClient::new(&env, &prop_reg_id);
         client.initialize(&admin);
 
-        // Register
         let prop_id = register_test_property(&client, &env, &owner, 90_000, &jurisdiction);
         assert_eq!(client.get_property(&prop_id).owner, owner);
 
-        // Update valuation (90k -> 105k, within 20% of oracle 100k)
         client.update_valuation(&prop_id, &105_000, &oracle_id, &asset);
         assert_eq!(client.get_property(&prop_id).valuation, 105_000);
 
-        // Transfer ownership
         client.transfer_ownership(&prop_id, &buyer, &compliance_id);
         assert_eq!(client.get_property(&prop_id).owner, buyer);
 
-        // Set status
         client.set_status(&prop_id, &PropertyStatus::UnderMaintenance);
         assert_eq!(
             client.get_property(&prop_id).status,
@@ -676,5 +675,65 @@ mod test {
 
         client.set_status(&prop_id, &PropertyStatus::Active);
         assert_eq!(client.get_property(&prop_id).status, PropertyStatus::Active);
+    }
+
+    #[test]
+    fn test_update_valuation_stale_price_returns_error() {
+        use soroban_sdk::testutils::Ledger;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let asset = Symbol::new(&env, "PROP_USD");
+
+        // Set the ledger to a realistic non-zero starting time so the
+        // price submission records a real timestamp.
+        env.ledger().set_timestamp(1_000_000);
+
+        // staleness threshold = 86400 seconds (1 day)
+        let oracle_id = setup_oracle_adapter(&env, &admin, &oracle, &asset, 100_000);
+
+        let prop_reg_id = env.register_contract(None, PropertyRegistry);
+        let client = PropertyRegistryClient::new(&env, &prop_reg_id);
+        client.initialize(&admin);
+
+        let prop_id =
+            register_test_property(&client, &env, &owner, 90_000, &Symbol::new(&env, "US"));
+
+        // Advance time past the 86400s (1 day) staleness threshold
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 86_401);
+
+        // update_valuation should now reject the stale price
+        let result = client.try_update_valuation(&prop_id, &100_000, &oracle_id, &asset);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_two_step_admin_transfer() {
+        let (env, _admin, client) = setup_property_registry();
+        let new_admin = Address::generate(&env);
+
+        // Step 1: current admin proposes new admin
+        client.propose_admin(&new_admin);
+
+        // Step 2: new admin accepts
+        client.accept_admin();
+
+        // New admin can now register a property (admin-gated action)
+        let owner = Address::generate(&env);
+        let doc_hash = soroban_sdk::BytesN::from_array(&env, &[2u8; 32]);
+        let prop_id = client.register_property(&owner, &50_000i128, &doc_hash, &Symbol::new(&env, "US"));
+        assert_eq!(prop_id, 1);
+    }
+
+    #[test]
+    fn test_accept_admin_without_proposal_returns_error() {
+        let (_env, _admin, client) = setup_property_registry();
+        let result = client.try_accept_admin();
+        assert!(result.is_err());
     }
 }

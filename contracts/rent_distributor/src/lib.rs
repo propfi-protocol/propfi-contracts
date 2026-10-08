@@ -1,6 +1,19 @@
 #![no_std]
 //! Pro-rata rent distribution engine. Deposits are tracked per property and distributed to fraction holders based on their balance.
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Vec};
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum RentDistributorError {
+    AlreadyInitialized = 1,
+    Unauthorized = 2,
+    InvalidAmount = 3,
+    NoFractionsIssued = 4,
+    NoYieldToClaim = 5,
+    RentTokenNotSet = 6,
+    FractionVaultNotSet = 7,
+    UnauthorizedCheckpoint = 8,
+}
 
 #[derive(Clone)]
 #[contracttype]
@@ -16,25 +29,40 @@ pub enum DataKey {
 
 const SCALING_FACTOR: i128 = 1_000_000_000_000; // 1e12
 
+/// Bump instance TTL to ~60 days (in ledgers at 5s/ledger) whenever the current
+/// TTL falls below ~30 days. Called on every public entry point so active
+/// contracts never silently expire their on-chain state.
+const INSTANCE_TTL_THRESHOLD: u32 = 518_400;  // 30 days in ledgers
+const INSTANCE_TTL_EXTEND_TO: u32 = 1_036_800; // 60 days in ledgers
+
 #[contract]
 pub struct RentDistributor;
 
 #[contractimpl]
 impl RentDistributor {
     /// Sets the admin address. Called once at deployment.
-    pub fn initialize(env: Env, admin: Address) {
+    pub fn initialize(env: Env, admin: Address) -> Result<(), RentDistributorError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let existing: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         if existing.is_some() {
-            panic!("already initialized");
+            return Err(RentDistributorError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        Ok(())
     }
 
     /// Deposits `amount` of `token` as rent for a property. Caller must authorize and transfer tokens.
-    pub fn deposit_rent(env: Env, sender: Address, prop_id: u64, amount: i128, token: Address) {
+    pub fn deposit_rent(
+        env: Env,
+        sender: Address,
+        prop_id: u64,
+        amount: i128,
+        token: Address,
+    ) -> Result<(), RentDistributorError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         sender.require_auth();
         if amount <= 0 {
-            panic!("amount must be positive");
+            return Err(RentDistributorError::InvalidAmount);
         }
 
         let vault = env.current_contract_address();
@@ -51,7 +79,7 @@ impl RentDistributor {
             .storage()
             .instance()
             .get(&DataKey::FractionVault)
-            .unwrap();
+            .ok_or(RentDistributorError::FractionVaultNotSet)?;
         let info: (u128, i128, Address, Address, Address) = env.invoke_contract(
             &fraction_vault,
             &Symbol::new(&env, "get_fraction_info"),
@@ -60,7 +88,7 @@ impl RentDistributor {
         let total_supply = info.0;
 
         if total_supply == 0 {
-            panic!("no fractions issued for property");
+            return Err(RentDistributorError::NoFractionsIssued);
         }
 
         let yield_per_share = amount
@@ -87,10 +115,13 @@ impl RentDistributor {
             (Symbol::new(&env, "RentDeposited"), prop_id),
             (sender, amount, token),
         );
+
+        Ok(())
     }
 
     /// Triggers yield distribution for a property. Emits a YieldDistributed event.
     pub fn distribute(env: Env, prop_id: u64) {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.events().publish(
             (Symbol::new(&env, "YieldDistributed"), prop_id),
             env.ledger().timestamp(),
@@ -98,19 +129,24 @@ impl RentDistributor {
     }
 
     /// Claims all pending yield for an investor on a property. Transfers tokens to the investor.
-    pub fn claim(env: Env, prop_id: u64, investor: Address) {
+    pub fn claim(
+        env: Env,
+        prop_id: u64,
+        investor: Address,
+    ) -> Result<(), RentDistributorError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         investor.require_auth();
 
-        let pending = RentDistributor::pending_yield(env.clone(), investor.clone(), prop_id);
+        let pending = RentDistributor::pending_yield(env.clone(), investor.clone(), prop_id)?;
         if pending <= 0 {
-            panic!("no yield to claim");
+            return Err(RentDistributorError::NoYieldToClaim);
         }
 
         let token: Address = env
             .storage()
             .instance()
             .get(&DataKey::RentToken(prop_id))
-            .unwrap_or_else(|| panic!("no rent token set"));
+            .ok_or(RentDistributorError::RentTokenNotSet)?;
 
         let current_acc: i128 = env
             .storage()
@@ -139,53 +175,83 @@ impl RentDistributor {
             (Symbol::new(&env, "YieldClaimed"), prop_id),
             (investor, pending, token),
         );
+
+        Ok(())
     }
 
     /// Returns the pending (unclaimed) yield for an investor on a property.
-    pub fn pending_yield(env: Env, investor: Address, prop_id: u64) -> i128 {
+    pub fn pending_yield(
+        env: Env,
+        investor: Address,
+        prop_id: u64,
+    ) -> Result<i128, RentDistributorError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let fraction_vault: Address = env
             .storage()
             .instance()
             .get(&DataKey::FractionVault)
-            .unwrap();
+            .ok_or(RentDistributorError::FractionVaultNotSet)?;
         let balance: u128 = env.invoke_contract(
             &fraction_vault,
             &Symbol::new(&env, "get_balance"),
             Vec::from_array(&env, [investor.to_val(), prop_id.into_val(&env)]),
         );
 
-        RentDistributor::pending_yield_internal(&env, investor, prop_id, balance)
+        Ok(RentDistributor::pending_yield_internal(&env, investor, prop_id, balance))
     }
 
     /// Sets the distribution interval in days for a property. Admin-only.
-    pub fn set_schedule(env: Env, prop_id: u64, interval_days: u32) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    pub fn set_schedule(
+        env: Env,
+        prop_id: u64,
+        interval_days: u32,
+    ) -> Result<(), RentDistributorError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(RentDistributorError::Unauthorized)?;
         admin.require_auth();
 
         env.storage()
             .instance()
             .set(&DataKey::Schedule(prop_id), &interval_days);
+        Ok(())
     }
 
     /// Sets the FractionVault contract address for balance queries. Admin-only.
-    pub fn set_fraction_vault(env: Env, vault: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    pub fn set_fraction_vault(env: Env, vault: Address) -> Result<(), RentDistributorError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(RentDistributorError::Unauthorized)?;
         admin.require_auth();
         env.storage()
             .instance()
             .set(&DataKey::FractionVault, &vault);
+        Ok(())
     }
 
     /// Called by FractionVault when a user's balance changes. Records the yield snapshot.
-    pub fn checkpoint(env: Env, caller: Address, investor: Address, prop_id: u64, balance: u128) {
+    pub fn checkpoint(
+        env: Env,
+        caller: Address,
+        investor: Address,
+        prop_id: u64,
+        balance: u128,
+    ) -> Result<(), RentDistributorError> {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         caller.require_auth();
         let fraction_vault: Address = env
             .storage()
             .instance()
             .get(&DataKey::FractionVault)
-            .unwrap();
+            .ok_or(RentDistributorError::FractionVaultNotSet)?;
         if caller != fraction_vault {
-            panic!("unauthorized checkpoint");
+            return Err(RentDistributorError::UnauthorizedCheckpoint);
         }
 
         let pending =
@@ -203,6 +269,8 @@ impl RentDistributor {
             &DataKey::UserLastYield(investor.clone(), prop_id),
             &current_acc,
         );
+
+        Ok(())
     }
 
     fn pending_yield_internal(env: &Env, investor: Address, prop_id: u64, balance: u128) -> i128 {
