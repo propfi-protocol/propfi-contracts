@@ -242,9 +242,12 @@ impl MortgagePool {
             loan.amount = 0;
             loan.status = LoanStatus::Repaid;
         } else {
+            // Reduce principal by the amount above interest paid
             if repayment > interest {
                 loan.amount -= repayment - interest;
             }
+            // Always advance the interest checkpoint so the repaid interest
+            // period is not double-charged on the next repayment call.
             loan.last_repayment_at = env.ledger().timestamp();
         }
 
@@ -633,5 +636,47 @@ mod test {
         // Can withdraw within available liquidity
         pool.withdraw_liquidity(&admin, &10_000i128);
         assert_eq!(pool.lp_balance(&admin), 40_000);
+    }
+
+    /// Regression test for the interest double-charge bug.
+    ///
+    /// Before the fix, a partial repayment that only covered interest (i.e.
+    /// `repayment <= interest`) left `last_repayment_at` unchanged.  The next
+    /// repayment call would then re-compute interest from the same old baseline,
+    /// effectively charging the same interest period twice.
+    #[test]
+    fn test_partial_interest_repayment_advances_checkpoint() {
+        let (env, admin, owner, pool, token, _, _) = setup();
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        sac.mint(&admin, &100_000i128);
+        pool.deposit_liquidity(&admin, &50_000i128);
+
+        let loan_id = pool.open_loan(&owner, &1u64, &20_000i128);
+
+        // Advance one year so that interest accrues
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + SECONDS_PER_YEAR);
+
+        // Interest for one year at 5% on 20_000 = 1_000
+        // Pay only the interest (1_000) — principal stays at 20_000
+        sac.mint(&owner, &1_000i128);
+        pool.repay(&owner, &loan_id, &1_000i128);
+
+        let loan_after_interest_pay = pool.get_loan(&loan_id);
+        // Principal unchanged
+        assert_eq!(loan_after_interest_pay.amount, 20_000);
+
+        // Advance another year; interest should accrue from the NEW checkpoint,
+        // NOT from the original loan creation time.
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + SECONDS_PER_YEAR);
+
+        // Now pay the remaining principal + one more year of interest
+        sac.mint(&owner, &21_000i128);
+        pool.repay(&owner, &loan_id, &21_000i128);
+
+        let loan_final = pool.get_loan(&loan_id);
+        assert_eq!(loan_final.status, LoanStatus::Repaid);
+        assert_eq!(loan_final.amount, 0);
     }
 }
