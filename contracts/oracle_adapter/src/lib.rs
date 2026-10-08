@@ -10,6 +10,8 @@ pub enum OracleAdapterError {
     Unauthorized = 2,
     OracleNotRegistered = 3,
     OracleNotActive = 4,
+    PriceStale = 5,
+    NoPriceAvailable = 6,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -253,6 +255,8 @@ impl OracleAdapter {
     }
 
     /// Returns the latest weighted aggregate price for an asset, or a zeroed struct if no data.
+    /// Emits a StaleAlert event when the price exceeds the staleness threshold but still returns it.
+    /// Use get_price_strict() when stale prices must be rejected.
     pub fn get_price(env: Env, asset: Symbol) -> PriceData {
         let price_data: PriceData = env
             .storage()
@@ -282,6 +286,38 @@ impl OracleAdapter {
         }
 
         price_data
+    }
+
+    /// Returns the latest price only if it is fresh (within the staleness threshold).
+    /// Returns PriceStale when the price is older than the configured threshold, and
+    /// NoPriceAvailable when no price has been submitted yet.
+    /// Use this instead of get_price() in any context where acting on stale data is unsafe.
+    pub fn get_price_strict(
+        env: Env,
+        asset: Symbol,
+    ) -> Result<PriceData, OracleAdapterError> {
+        let price_data: PriceData = env
+            .storage()
+            .instance()
+            .get(&DataKey::AssetPrice(asset.clone()))
+            .ok_or(OracleAdapterError::NoPriceAvailable)?;
+
+        if price_data.price <= 0 || price_data.timestamp == 0 {
+            return Err(OracleAdapterError::NoPriceAvailable);
+        }
+
+        let threshold: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StalenessThreshold)
+            .unwrap_or(0);
+
+        let now = env.ledger().timestamp();
+        if threshold > 0 && now > price_data.timestamp && now - price_data.timestamp > threshold {
+            return Err(OracleAdapterError::PriceStale);
+        }
+
+        Ok(price_data)
     }
 
     /// Computes the time-weighted average price over the given window (in seconds).
@@ -336,6 +372,14 @@ impl OracleAdapter {
                 weight: 0,
                 active: false,
             })
+    }
+
+    /// Returns the configured staleness threshold in seconds.
+    pub fn get_staleness_threshold(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::StalenessThreshold)
+            .unwrap_or(0)
     }
 }
 
@@ -550,5 +594,45 @@ mod test {
         client.remove_oracle(&oracle);
         let result = client.try_submit_price(&oracle, &asset, &50000i128);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_price_strict_fresh_price_succeeds() {
+        let (env, oracle, _admin, asset, client) = setup_with_oracle();
+        // Set a realistic starting timestamp so the price gets a non-zero timestamp
+        env.ledger().set_timestamp(1_000_000);
+        client.submit_price(&oracle, &asset, &50000i128);
+
+        // Advance well within the 86400s window
+        env.ledger().set_timestamp(1_000_000 + 3600);
+        let result = client.try_get_price_strict(&asset);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().unwrap().price, 50000);
+    }
+
+    #[test]
+    fn test_get_price_strict_stale_price_returns_error() {
+        let (env, oracle, _admin, asset, client) = setup_with_oracle();
+        env.ledger().set_timestamp(1_000_000);
+        client.submit_price(&oracle, &asset, &50000i128);
+
+        // Advance past the 86400s threshold
+        env.ledger().set_timestamp(1_000_000 + 86_401);
+        let result = client.try_get_price_strict(&asset);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_price_strict_no_price_returns_error() {
+        let (env, _admin, _oracle, client) = setup();
+        let asset = Symbol::new(&env, "BTC_USD");
+        let result = client.try_get_price_strict(&asset);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_staleness_threshold() {
+        let (_env, _admin, _oracle, client) = setup();
+        assert_eq!(client.get_staleness_threshold(), 86400u64);
     }
 }

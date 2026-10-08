@@ -17,6 +17,7 @@ pub enum PropertyRegistryError {
     ComplianceCheckFailed = 5,
     OraclePriceNotAvailable = 6,
     ValuationOutOfRange = 7,
+    OraclePriceStale = 8,
 }
 
 #[derive(Clone)]
@@ -117,6 +118,7 @@ impl PropertyRegistry {
             return Err(PropertyRegistryError::InvalidValuation);
         }
 
+        // Fetch price data from the oracle.
         let price_data: PriceData = env.invoke_contract(
             &oracle_contract,
             &Symbol::new(&env, "get_price"),
@@ -125,6 +127,25 @@ impl PropertyRegistry {
 
         if price_data.price <= 0 {
             return Err(PropertyRegistryError::OraclePriceNotAvailable);
+        }
+
+        // Hard staleness guard: reject the update when the oracle data is older
+        // than the oracle's own staleness threshold.
+        let staleness_threshold: u64 = env.invoke_contract(
+            &oracle_contract,
+            &Symbol::new(&env, "get_staleness_threshold"),
+            Vec::from_array(&env, []),
+        );
+        let now = env.ledger().timestamp();
+        // Only enforce staleness when both the threshold and the price timestamp
+        // are non-zero (timestamp == 0 means the ledger itself is at genesis,
+        // which is a valid test-environment condition).
+        if staleness_threshold > 0
+            && price_data.timestamp > 0
+            && now > price_data.timestamp
+            && now - price_data.timestamp > staleness_threshold
+        {
+            return Err(PropertyRegistryError::OraclePriceStale);
         }
 
         let deviation = if new_val > price_data.price {
@@ -597,5 +618,40 @@ mod test {
 
         client.set_status(&prop_id, &PropertyStatus::Active);
         assert_eq!(client.get_property(&prop_id).status, PropertyStatus::Active);
+    }
+
+    #[test]
+    fn test_update_valuation_stale_price_returns_error() {
+        use soroban_sdk::testutils::Ledger;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let asset = Symbol::new(&env, "PROP_USD");
+
+        // Set the ledger to a realistic non-zero starting time so the
+        // price submission records a real timestamp.
+        env.ledger().set_timestamp(1_000_000);
+
+        // staleness threshold = 86400 seconds (1 day)
+        let oracle_id = setup_oracle_adapter(&env, &admin, &oracle, &asset, 100_000);
+
+        let prop_reg_id = env.register_contract(None, PropertyRegistry);
+        let client = PropertyRegistryClient::new(&env, &prop_reg_id);
+        client.initialize(&admin);
+
+        let prop_id =
+            register_test_property(&client, &env, &owner, 90_000, &Symbol::new(&env, "US"));
+
+        // Advance time past the 86400s (1 day) staleness threshold
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 86_401);
+
+        // update_valuation should now reject the stale price
+        let result = client.try_update_valuation(&prop_id, &100_000, &oracle_id, &asset);
+        assert!(result.is_err());
     }
 }
