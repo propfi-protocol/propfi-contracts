@@ -1,6 +1,6 @@
 #![no_std]
 //! Manages fractional ownership of tokenized properties. Supports minting fractions, buying/selling on secondary market, and holder tracking.
-use propfi_types::PropertyData;
+use propfi_types::{PropertyData, PropertyStatus};
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Vec};
 
 #[contracterror]
@@ -17,6 +17,7 @@ pub enum FractionVaultError {
     InsufficientBalance = 9,
     PriceTooLow = 10,
     SupplyExceeded = 11,
+    PropertyNotActive = 12,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -232,11 +233,16 @@ impl FractionVault {
         // Checkpoint before balance change
         Self::checkpoint_yield(&env, &buyer, prop_id, balance);
 
-        let _property: PropertyData = env.invoke_contract(
+        let property: PropertyData = env.invoke_contract(
             &info.property_registry,
             &Symbol::new(&env, "get_property"),
             Vec::from_array(&env, [prop_id.into_val(&env)]),
         );
+
+        // Block purchases on inactive or under-maintenance properties
+        if property.status != PropertyStatus::Active {
+            return Err(FractionVaultError::PropertyNotActive);
+        }
 
         let jurisdiction: Symbol = env.invoke_contract(
             &info.property_registry,
@@ -845,5 +851,47 @@ mod test {
         assert_eq!(vault.get_balance(&user, &prop_id), 0);
         assert_eq!(vault.total_holders(&prop_id), 0);
         assert_eq!(vault.minted_supply(&prop_id), 0);
+    }
+
+    #[test]
+    fn test_buy_fraction_inactive_property_returns_error() {
+        use propfi_property_registry::PropertyRegistryClient;
+
+        let (env, admin, owner) = setup_base();
+        let prop_id = 1u64;
+
+        let token = setup_token(&env, &admin);
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        sac.mint(&admin, &1_000_000i128);
+
+        let (prop_id_reg, prop_reg_id, compliance_id) = register_property(&env, &admin, &owner);
+        assert_eq!(prop_id_reg, prop_id);
+
+        let vault = setup_vault(&env, &admin);
+        vault.fractionalize(
+            &prop_id,
+            &1000u128,
+            &100i128,
+            &token,
+            &prop_reg_id,
+            &compliance_id,
+        );
+
+        // Mark the property as Inactive
+        let prop_reg_client = PropertyRegistryClient::new(&env, &prop_reg_id);
+        prop_reg_client.set_status(&prop_id, &propfi_types::PropertyStatus::Inactive);
+
+        let buyer = Address::generate(&env);
+        sac.mint(&buyer, &100_000i128);
+        attest_buyer(&env, &compliance_id, &buyer);
+
+        // Purchase should be blocked
+        let result = vault.try_buy_fraction(&buyer, &prop_id, &10u128);
+        assert!(result.is_err());
+
+        // Re-activating should unblock purchases
+        prop_reg_client.set_status(&prop_id, &propfi_types::PropertyStatus::Active);
+        vault.buy_fraction(&buyer, &prop_id, &10u128);
+        assert_eq!(vault.get_balance(&buyer, &prop_id), 10);
     }
 }

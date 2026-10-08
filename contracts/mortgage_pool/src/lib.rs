@@ -1,6 +1,6 @@
 #![no_std]
 //! Permissionless on-chain lending against tokenized property equity. LTV-gated with automated liquidation at 80% threshold.
-use propfi_types::{HealthFactor, LoanData, LoanStatus, PropertyData};
+use propfi_types::{HealthFactor, LoanData, LoanStatus, PropertyData, PropertyStatus};
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Vec};
 
 #[contracterror]
@@ -16,6 +16,7 @@ pub enum MortgagePoolError {
     InsufficientLpBalance = 8,
     LoanIsHealthy = 9,
     ContractPaused = 10,
+    PropertyNotActive = 11,
 }
 
 #[derive(Clone)]
@@ -133,6 +134,11 @@ impl MortgagePool {
 
         if property.owner != borrower {
             return Err(MortgagePoolError::OnlyPropertyOwner);
+        }
+
+        // Only allow loans against actively-listed properties
+        if property.status != PropertyStatus::Active {
+            return Err(MortgagePoolError::PropertyNotActive);
         }
 
         let valuation = property.valuation;
@@ -678,5 +684,23 @@ mod test {
         let loan_final = pool.get_loan(&loan_id);
         assert_eq!(loan_final.status, LoanStatus::Repaid);
         assert_eq!(loan_final.amount, 0);
+    }
+
+    #[test]
+    fn test_open_loan_inactive_property_returns_error() {
+        let (env, admin, owner, pool, token, prop_reg_id, _oracle_id) = setup();
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        sac.mint(&admin, &100_000i128);
+        pool.deposit_liquidity(&admin, &100_000i128);
+
+        // Mark the property as Inactive
+        let prop_reg_client = PropertyRegistryClient::new(&env, &prop_reg_id);
+        prop_reg_client.set_status(
+            &1u64,
+            &propfi_types::PropertyStatus::Inactive,
+        );
+
+        let result = pool.try_open_loan(&owner, &1u64, &30_000i128);
+        assert!(result.is_err());
     }
 }
