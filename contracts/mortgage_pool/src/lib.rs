@@ -1,7 +1,10 @@
 #![no_std]
+#![allow(deprecated)]
 //! Permissionless on-chain lending against tokenized property equity. LTV-gated with automated liquidation at 80% threshold.
 use propfi_types::{HealthFactor, LoanData, LoanStatus, PropertyData, PropertyStatus};
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Vec,
+};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -41,7 +44,7 @@ const SECONDS_PER_YEAR: u64 = 31_536_000;
 /// Bump instance TTL to ~60 days (in ledgers at 5s/ledger) whenever the current
 /// TTL falls below ~30 days. Called on every public entry point so active
 /// contracts never silently expire their on-chain state.
-const INSTANCE_TTL_THRESHOLD: u32 = 518_400;  // 30 days in ledgers
+const INSTANCE_TTL_THRESHOLD: u32 = 518_400; // 30 days in ledgers
 const INSTANCE_TTL_EXTEND_TO: u32 = 1_036_800; // 60 days in ledgers
 
 #[contract]
@@ -57,7 +60,9 @@ impl MortgagePool {
         property_reg: Address,
         oracle: Address,
     ) -> Result<(), MortgagePoolError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let existing: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         if existing.is_some() {
             return Err(MortgagePoolError::AlreadyInitialized);
@@ -82,7 +87,9 @@ impl MortgagePool {
 
     /// Pauses the contract. Admin-only. Blocks open_loan and deposit_liquidity.
     pub fn pause(env: Env) -> Result<(), MortgagePoolError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -97,7 +104,9 @@ impl MortgagePool {
 
     /// Unpauses the contract. Admin-only.
     pub fn unpause(env: Env) -> Result<(), MortgagePoolError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -112,7 +121,9 @@ impl MortgagePool {
 
     /// Returns whether the contract is paused.
     pub fn is_paused(env: Env) -> bool {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::Paused)
@@ -126,7 +137,9 @@ impl MortgagePool {
         prop_id: u64,
         amount: i128,
     ) -> Result<u64, MortgagePoolError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         if Self::is_paused(env.clone()) {
             return Err(MortgagePoolError::ContractPaused);
         }
@@ -225,7 +238,9 @@ impl MortgagePool {
         loan_id: u64,
         amount: i128,
     ) -> Result<(), MortgagePoolError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         borrower.require_auth();
         let mut loan: LoanData = env
             .storage()
@@ -239,7 +254,11 @@ impl MortgagePool {
         let interest = MortgagePool::calculate_interest_internal(env.clone(), &loan);
         let total_due = loan.amount + interest;
 
-        let repayment = if amount > total_due { total_due } else { amount };
+        let repayment = if amount > total_due {
+            total_due
+        } else {
+            amount
+        };
 
         let token: Address = env
             .storage()
@@ -288,12 +307,10 @@ impl MortgagePool {
     }
 
     /// Liquidates an underwater loan (LTV > 80%). Callable by anyone.
-    pub fn liquidate(
-        env: Env,
-        liquidator: Address,
-        loan_id: u64,
-    ) -> Result<(), MortgagePoolError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+    pub fn liquidate(env: Env, liquidator: Address, loan_id: u64) -> Result<(), MortgagePoolError> {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         liquidator.require_auth();
         let mut loan: LoanData = env
             .storage()
@@ -319,7 +336,9 @@ impl MortgagePool {
 
     /// Deposits tokens to the liquidity pool. Callable by any LP.
     pub fn deposit_liquidity(env: Env, lp: Address, amount: i128) -> Result<(), MortgagePoolError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         if Self::is_paused(env.clone()) {
             return Err(MortgagePoolError::ContractPaused);
         }
@@ -362,7 +381,9 @@ impl MortgagePool {
         lp: Address,
         amount: i128,
     ) -> Result<(), MortgagePoolError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         lp.require_auth();
 
         let key = DataKey::Liquidity(lp.clone());
@@ -404,7 +425,9 @@ impl MortgagePool {
 
     /// Returns the HealthFactor for a loan, indicating whether it's at risk of liquidation.
     pub fn loan_health(env: Env, loan_id: u64) -> Result<HealthFactor, MortgagePoolError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let loan: LoanData = env
             .storage()
             .instance()
@@ -434,7 +457,9 @@ impl MortgagePool {
 
     /// Returns the full LoanData for a given loan ID.
     pub fn get_loan(env: Env, loan_id: u64) -> Result<LoanData, MortgagePoolError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::Loan(loan_id))
@@ -443,7 +468,9 @@ impl MortgagePool {
 
     /// Returns the LP deposit balance for a given address.
     pub fn lp_balance(env: Env, lp: Address) -> i128 {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::Liquidity(lp))
@@ -452,7 +479,9 @@ impl MortgagePool {
 
     /// Returns total available liquidity in the pool.
     pub fn total_liquidity(env: Env) -> i128 {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::TotalLiquidity)
@@ -714,10 +743,7 @@ mod test {
 
         // Mark the property as Inactive
         let prop_reg_client = PropertyRegistryClient::new(&env, &prop_reg_id);
-        prop_reg_client.set_status(
-            &1u64,
-            &propfi_types::PropertyStatus::Inactive,
-        );
+        prop_reg_client.set_status(&1u64, &propfi_types::PropertyStatus::Inactive);
 
         let result = pool.try_open_loan(&owner, &1u64, &30_000i128);
         assert!(result.is_err());

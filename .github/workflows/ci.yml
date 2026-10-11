@@ -17,10 +17,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace --target wasm32-unknown-unknown --release --exclude propfi-integration-tests
+      - run: cargo build --workspace --target wasm32v1-none --release --exclude propfi-integration-tests
       - run: cargo build --workspace
 
   test:
@@ -29,8 +27,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
@@ -42,7 +38,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       # integration_tests uses soroban testutils which are only available as
       # dev-dependencies; clippy on the lib target fails without them.

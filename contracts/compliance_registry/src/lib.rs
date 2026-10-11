@@ -5,8 +5,11 @@
 //! and other contracts for compliance checks on transfers and investments.
 
 #![no_std]
+#![allow(deprecated)]
 use propfi_types::JurisdictionRules;
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Bytes, Env, Symbol};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, Bytes, Env, Symbol,
+};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -48,7 +51,7 @@ const DAY: u64 = 86400;
 /// Bump instance TTL to ~60 days (in ledgers at 5s/ledger) whenever current
 /// TTL falls below ~30 days. Called on every public entry point so that active
 /// contracts never silently expire their on-chain state.
-const INSTANCE_TTL_THRESHOLD: u32 = 518_400;  // 30 days
+const INSTANCE_TTL_THRESHOLD: u32 = 518_400; // 30 days
 const INSTANCE_TTL_EXTEND_TO: u32 = 1_036_800; // 60 days
 
 #[contract]
@@ -58,7 +61,9 @@ pub struct ComplianceRegistry;
 impl ComplianceRegistry {
     /// Sets the admin address. Called once at deployment.
     pub fn initialize(env: Env, admin: Address) -> Result<(), ComplianceRegistryError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let existing: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         if existing.is_some() {
             return Err(ComplianceRegistryError::AlreadyInitialized);
@@ -79,7 +84,9 @@ impl ComplianceRegistry {
         jurisdiction: Symbol,
         duration_days: u32,
     ) -> Result<(), ComplianceRegistryError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -100,9 +107,10 @@ impl ComplianceRegistry {
             active: true,
         };
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Attestation(user.clone(), jurisdiction.clone()), &attestation);
+        env.storage().instance().set(
+            &DataKey::Attestation(user.clone(), jurisdiction.clone()),
+            &attestation,
+        );
 
         env.events().publish(
             (Symbol::new(&env, "Attested"), user),
@@ -115,7 +123,9 @@ impl ComplianceRegistry {
     /// Checks whether `user` has a valid, non-expired attestation for `jurisdiction`.
     /// Also enforces min-remaining-days rules if configured.
     pub fn is_compliant(env: Env, user: Address, jurisdiction: Symbol) -> bool {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let key = DataKey::Attestation(user, jurisdiction.clone());
         let attestation = match env.storage().instance().get::<DataKey, Attestation>(&key) {
             Some(a) => a,
@@ -147,8 +157,14 @@ impl ComplianceRegistry {
 
     /// Revokes a user's attestation for a specific jurisdiction. Only callable by the admin.
     /// Emits a `Revoked` event. All compliance checks will fail for this user and jurisdiction.
-    pub fn revoke(env: Env, user: Address, jurisdiction: Symbol) -> Result<(), ComplianceRegistryError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+    pub fn revoke(
+        env: Env,
+        user: Address,
+        jurisdiction: Symbol,
+    ) -> Result<(), ComplianceRegistryError> {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -178,7 +194,9 @@ impl ComplianceRegistry {
         jurisdiction: Symbol,
         rules: JurisdictionRules,
     ) -> Result<(), ComplianceRegistryError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -198,7 +216,9 @@ impl ComplianceRegistry {
     /// Returns the ledger timestamp at which the user's attestation for the given jurisdiction expires.
     /// Returns 0 if the user has no attestation for that jurisdiction.
     pub fn attestation_expiry(env: Env, user: Address, jurisdiction: Symbol) -> u64 {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let key = DataKey::Attestation(user, jurisdiction);
         match env.storage().instance().get::<DataKey, Attestation>(&key) {
             Some(a) => a.expiry,
@@ -208,7 +228,9 @@ impl ComplianceRegistry {
 
     /// Returns the full Attestation record for a user and jurisdiction, if it exists.
     pub fn get_attestation(env: Env, user: Address, jurisdiction: Symbol) -> Option<Attestation> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::Attestation(user, jurisdiction))
@@ -217,11 +239,10 @@ impl ComplianceRegistry {
     /// Initiates a two-step admin transfer. The current admin nominates a new admin
     /// address, which must call `accept_admin()` to complete the handover.
     /// Emits an `AdminTransferProposed` event.
-    pub fn propose_admin(
-        env: Env,
-        new_admin: Address,
-    ) -> Result<(), ComplianceRegistryError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), ComplianceRegistryError> {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -233,15 +254,19 @@ impl ComplianceRegistry {
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin.clone());
 
-        env.events()
-            .publish((Symbol::new(&env, "AdminTransferProposed"),), (admin, new_admin));
+        env.events().publish(
+            (Symbol::new(&env, "AdminTransferProposed"),),
+            (admin, new_admin),
+        );
         Ok(())
     }
 
     /// Completes the two-step admin transfer. The pending admin must call this to
     /// become the new admin. Emits an `AdminTransferred` event.
     pub fn accept_admin(env: Env) -> Result<(), ComplianceRegistryError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let pending: Address = env
             .storage()
             .instance()

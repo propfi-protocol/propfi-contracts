@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(deprecated)]
 //! Tokenizes real-world properties as on-chain assets with oracle-fed valuations and compliance-gated transfers.
 use propfi_types::{PriceData, PropertyData, PropertyStatus};
 use soroban_sdk::{
@@ -35,7 +36,7 @@ pub enum DataKey {
 /// Bump instance TTL to ~60 days (in ledgers at 5s/ledger) whenever the current
 /// TTL falls below ~30 days. Called on every public entry point so active
 /// contracts never silently expire their on-chain state.
-const INSTANCE_TTL_THRESHOLD: u32 = 518_400;  // 30 days in ledgers
+const INSTANCE_TTL_THRESHOLD: u32 = 518_400; // 30 days in ledgers
 const INSTANCE_TTL_EXTEND_TO: u32 = 1_036_800; // 60 days in ledgers
 
 #[contract]
@@ -45,7 +46,9 @@ pub struct PropertyRegistry;
 impl PropertyRegistry {
     /// Sets the admin address. Called once at deployment.
     pub fn initialize(env: Env, admin: Address) -> Result<(), PropertyRegistryError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let existing: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         if existing.is_some() {
             return Err(PropertyRegistryError::AlreadyInitialized);
@@ -62,7 +65,9 @@ impl PropertyRegistry {
         doc_hash: BytesN<32>,
         jurisdiction: Symbol,
     ) -> Result<u64, PropertyRegistryError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -117,7 +122,9 @@ impl PropertyRegistry {
         oracle_contract: Address,
         asset: Symbol,
     ) -> Result<(), PropertyRegistryError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let mut property: PropertyData = env
             .storage()
             .instance()
@@ -189,7 +196,9 @@ impl PropertyRegistry {
         to: Address,
         compliance_contract: Address,
     ) -> Result<(), PropertyRegistryError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let mut property: PropertyData = env
             .storage()
             .instance()
@@ -230,7 +239,9 @@ impl PropertyRegistry {
 
     /// Returns the PropertyData for the given property ID.
     pub fn get_property(env: Env, prop_id: u64) -> Result<PropertyData, PropertyRegistryError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::Property(prop_id))
@@ -243,7 +254,9 @@ impl PropertyRegistry {
         prop_id: u64,
         status: PropertyStatus,
     ) -> Result<(), PropertyRegistryError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -270,7 +283,9 @@ impl PropertyRegistry {
         env: Env,
         prop_id: u64,
     ) -> Result<Symbol, PropertyRegistryError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::Jurisdiction(prop_id))
@@ -279,11 +294,10 @@ impl PropertyRegistry {
 
     /// Initiates a two-step admin transfer. The current admin nominates a new admin
     /// address, which must call `accept_admin()` to complete the handover.
-    pub fn propose_admin(
-        env: Env,
-        new_admin: Address,
-    ) -> Result<(), PropertyRegistryError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), PropertyRegistryError> {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -295,14 +309,18 @@ impl PropertyRegistry {
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin.clone());
 
-        env.events()
-            .publish((Symbol::new(&env, "AdminTransferProposed"),), (admin, new_admin));
+        env.events().publish(
+            (Symbol::new(&env, "AdminTransferProposed"),),
+            (admin, new_admin),
+        );
         Ok(())
     }
 
     /// Completes the two-step admin transfer. The pending admin must call this.
     pub fn accept_admin(env: Env) -> Result<(), PropertyRegistryError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let pending: Address = env
             .storage()
             .instance()
@@ -448,8 +466,7 @@ mod test {
         let (env, _admin, client) = setup_property_registry();
         let owner = Address::generate(&env);
         let doc_hash = BytesN::from_array(&env, &[0u8; 32]);
-        let result =
-            client.try_register_property(&owner, &-1, &doc_hash, &Symbol::new(&env, "US"));
+        let result = client.try_register_property(&owner, &-1, &doc_hash, &Symbol::new(&env, "US"));
         assert!(result.is_err());
     }
 
@@ -726,7 +743,8 @@ mod test {
         // New admin can now register a property (admin-gated action)
         let owner = Address::generate(&env);
         let doc_hash = soroban_sdk::BytesN::from_array(&env, &[2u8; 32]);
-        let prop_id = client.register_property(&owner, &50_000i128, &doc_hash, &Symbol::new(&env, "US"));
+        let prop_id =
+            client.register_property(&owner, &50_000i128, &doc_hash, &Symbol::new(&env, "US"));
         assert_eq!(prop_id, 1);
     }
 

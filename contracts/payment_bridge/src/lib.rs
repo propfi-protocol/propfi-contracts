@@ -1,7 +1,10 @@
 #![no_std]
+#![allow(deprecated)]
 //! Cross-border payment and remittance layer. Supports single and batch sends with anchor registration for fiat on/off ramps.
 use propfi_types::PathQuote;
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Vec,
+};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -26,7 +29,7 @@ pub enum DataKey {
 /// Bump instance TTL to ~60 days (in ledgers at 5s/ledger) whenever the current
 /// TTL falls below ~30 days. Called on every public entry point so active
 /// contracts never silently expire their on-chain state.
-const INSTANCE_TTL_THRESHOLD: u32 = 518_400;  // 30 days in ledgers
+const INSTANCE_TTL_THRESHOLD: u32 = 518_400; // 30 days in ledgers
 const INSTANCE_TTL_EXTEND_TO: u32 = 1_036_800; // 60 days in ledgers
 
 #[contract]
@@ -36,7 +39,9 @@ pub struct PaymentBridge;
 impl PaymentBridge {
     /// Sets the admin address. Called once at deployment.
     pub fn initialize(env: Env, admin: Address) -> Result<(), PaymentBridgeError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let existing: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         if existing.is_some() {
             return Err(PaymentBridgeError::AlreadyInitialized);
@@ -52,7 +57,9 @@ impl PaymentBridge {
         asset: Symbol,
         amount: i128,
     ) -> Result<(), PaymentBridgeError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         user.require_auth();
         if amount <= 0 {
             return Err(PaymentBridgeError::InvalidAmount);
@@ -88,7 +95,9 @@ impl PaymentBridge {
         asset: Symbol,
         amount: i128,
     ) -> Result<(), PaymentBridgeError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         user.require_auth();
         if amount <= 0 {
             return Err(PaymentBridgeError::InvalidAmount);
@@ -130,7 +139,9 @@ impl PaymentBridge {
         src: Symbol,
         dst: Symbol,
     ) -> Result<(), PaymentBridgeError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         from.require_auth();
         if amount <= 0 {
             return Err(PaymentBridgeError::InvalidAmount);
@@ -173,7 +184,9 @@ impl PaymentBridge {
         src: Symbol,
         dst: Symbol,
     ) -> Result<(), PaymentBridgeError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         from.require_auth();
 
         let mut total: i128 = 0;
@@ -224,7 +237,9 @@ impl PaymentBridge {
         asset: Symbol,
         token_address: Address,
     ) -> Result<(), PaymentBridgeError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -251,7 +266,9 @@ impl PaymentBridge {
         dst: Symbol,
         amount: i128,
     ) -> Result<PathQuote, PaymentBridgeError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         if amount <= 0 {
             return Err(PaymentBridgeError::InvalidAmount);
         }
@@ -295,7 +312,9 @@ impl PaymentBridge {
 
     /// Returns the bridge balance of a user for a given asset.
     pub fn get_balance(env: Env, user: Address, asset: Symbol) -> i128 {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::Balance(user, asset))

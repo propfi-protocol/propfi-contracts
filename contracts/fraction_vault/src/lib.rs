@@ -1,7 +1,10 @@
 #![no_std]
+#![allow(deprecated)]
 //! Manages fractional ownership of tokenized properties. Supports minting fractions, buying/selling on secondary market, and holder tracking.
 use propfi_types::{PropertyData, PropertyStatus};
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Vec,
+};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -47,7 +50,7 @@ pub enum DataKey {
 /// Bump instance TTL to ~60 days (in ledgers at 5s/ledger) whenever the current
 /// TTL falls below ~30 days. Called on every public entry point so active
 /// contracts never silently expire their on-chain state.
-const INSTANCE_TTL_THRESHOLD: u32 = 518_400;  // 30 days in ledgers
+const INSTANCE_TTL_THRESHOLD: u32 = 518_400; // 30 days in ledgers
 const INSTANCE_TTL_EXTEND_TO: u32 = 1_036_800; // 60 days in ledgers
 
 #[contract]
@@ -57,7 +60,9 @@ pub struct FractionVault;
 impl FractionVault {
     /// Sets the admin address. Called once at deployment.
     pub fn initialize(env: Env, admin: Address) -> Result<(), FractionVaultError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let existing: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         if existing.is_some() {
             return Err(FractionVaultError::AlreadyInitialized);
@@ -76,7 +81,9 @@ impl FractionVault {
         property_registry: Address,
         compliance_registry: Address,
     ) -> Result<(), FractionVaultError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -135,7 +142,9 @@ impl FractionVault {
 
     /// Returns the fraction balance of an investor for a given property.
     pub fn get_balance(env: Env, investor: Address, prop_id: u64) -> u128 {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::Balance(investor, prop_id))
@@ -144,7 +153,9 @@ impl FractionVault {
 
     /// Returns the total number of unique holders for a property.
     pub fn total_holders(env: Env, prop_id: u64) -> u32 {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::HolderCount(prop_id))
@@ -153,7 +164,9 @@ impl FractionVault {
 
     /// Returns the currently minted supply for a property.
     pub fn minted_supply(env: Env, prop_id: u64) -> u128 {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::MintedSupply(prop_id))
@@ -161,8 +174,13 @@ impl FractionVault {
     }
 
     /// Returns the FractionInfo struct for a property.
-    pub fn get_fraction_info(env: Env, prop_id: u64) -> Result<(u128, i128, Address, Address, Address), FractionVaultError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+    pub fn get_fraction_info(
+        env: Env,
+        prop_id: u64,
+    ) -> Result<(u128, i128, Address, Address, Address), FractionVaultError> {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let info: FractionInfo = env
             .storage()
             .instance()
@@ -179,7 +197,9 @@ impl FractionVault {
 
     /// Sets the RentDistributor contract address for yield checkpointing. Admin-only.
     pub fn set_rent_distributor(env: Env, distributor: Address) -> Result<(), FractionVaultError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -194,11 +214,10 @@ impl FractionVault {
 
     /// Initiates a two-step admin transfer. The current admin nominates a new admin
     /// address, which must call `accept_admin()` to complete the handover.
-    pub fn propose_admin(
-        env: Env,
-        new_admin: Address,
-    ) -> Result<(), FractionVaultError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), FractionVaultError> {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -210,14 +229,18 @@ impl FractionVault {
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin.clone());
 
-        env.events()
-            .publish((Symbol::new(&env, "AdminTransferProposed"),), (admin, new_admin));
+        env.events().publish(
+            (Symbol::new(&env, "AdminTransferProposed"),),
+            (admin, new_admin),
+        );
         Ok(())
     }
 
     /// Completes the two-step admin transfer. The pending admin must call this.
     pub fn accept_admin(env: Env) -> Result<(), FractionVaultError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         let pending: Address = env
             .storage()
             .instance()
@@ -262,7 +285,9 @@ impl FractionVault {
         prop_id: u64,
         amount: u128,
     ) -> Result<(), FractionVaultError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         buyer.require_auth();
 
         if amount == 0 {
@@ -363,7 +388,9 @@ impl FractionVault {
         amount: u128,
         min_price: i128,
     ) -> Result<(), FractionVaultError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         seller.require_auth();
 
         if amount == 0 {
@@ -440,7 +467,9 @@ impl FractionVault {
         prop_id: u64,
         amount: u128,
     ) -> Result<(), FractionVaultError> {
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
         from.require_auth();
 
         if amount == 0 {
