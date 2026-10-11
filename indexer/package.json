@@ -2,8 +2,9 @@
   "name": "@propfi/indexer",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
-    "dev": "ts-node src/index.ts",
+    "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "lint": "eslint .",
     "fmt": "prettier --write .",
@@ -21,7 +22,7 @@
   "devDependencies": {
     "@types/node": "^20.14.0",
     "prisma": "^5.14.0",
-    "ts-node": "^10.9.0",
+    "tsx": "^4.15.0",
     "typescript": "^7.0.2"
   }
 }

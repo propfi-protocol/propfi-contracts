@@ -1,13 +1,13 @@
 import { xdr } from '@stellar/stellar-sdk';
-import { parseEvent } from '../parse';
-import { handlePropertyEvent } from './property';
-import { handleFractionEvent } from './fraction';
-import { handleRentEvent } from './rent';
-import { handleMortgageEvent } from './mortgage';
-import { handleComplianceEvent } from './compliance';
-import { handleGovernanceEvent } from './governance';
-import { handleOracleEvent } from './oracle';
-import { handlePaymentEvent } from './payment';
+import { parseEvent } from '../parse.ts';
+import { handlePropertyEvent } from './property.ts';
+import { handleFractionEvent } from './fraction.ts';
+import { handleRentEvent } from './rent.ts';
+import { handleMortgageEvent } from './mortgage.ts';
+import { handleComplianceEvent } from './compliance.ts';
+import { handleGovernanceEvent } from './governance.ts';
+import { handleOracleEvent } from './oracle.ts';
+import { handlePaymentEvent } from './payment.ts';
 
 const LOG_PREFIX = '[Indexer]';
 

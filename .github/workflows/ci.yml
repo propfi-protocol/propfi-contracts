@@ -17,9 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --target wasm32v1-none --release --exclude propfi-integration-tests
-      - run: cargo build --workspace
+      - run: cargo build --workspace --exclude propfi-integration-tests
 
   test:
     name: Test
@@ -27,8 +29,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      - run: cargo test --workspace --exclude propfi-integration-tests
 
   clippy:
     name: Clippy

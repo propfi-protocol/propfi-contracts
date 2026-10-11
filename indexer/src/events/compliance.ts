@@ -1,4 +1,4 @@
-import { prisma } from '../db';
+import { prisma } from '../db.ts';
 
 export async function handleComplianceEvent(
   kind: string,

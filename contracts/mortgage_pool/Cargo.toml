@@ -8,10 +8,10 @@ crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]
-soroban-sdk = "28"
+soroban-sdk = { workspace = true }
 propfi-types = { path = "../types" }
 propfi-property-registry = { path = "../property_registry" }
 propfi-oracle-adapter = { path = "../oracle_adapter" }
 
 [dev-dependencies]
-soroban-sdk = { version = "28", features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }

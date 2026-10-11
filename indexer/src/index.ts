@@ -1,8 +1,7 @@
-import { SorobanRpc } from '@stellar/stellar-sdk';
-import { Contract } from '@stellar/stellar-base';
-import { loadConfig } from './config';
-import { prisma, getLastLedger, updateLastLedger } from './db';
-import { registerAllHandlers, processEvent } from './events';
+import { Server } from '@stellar/stellar-sdk/rpc';
+import { loadConfig } from './config.ts';
+import { prisma, getLastLedger, updateLastLedger } from './db.ts';
+import { registerAllHandlers, processEvent } from './events/index.ts';
 
 const LOG_PREFIX = '[Indexer]';
 
@@ -26,7 +25,7 @@ function buildContractNameMap(
 }
 
 async function pollLoop(config: ReturnType<typeof loadConfig>): Promise<void> {
-  const server = new SorobanRpc.Server(config.rpcUrl);
+  const server = new Server(config.rpcUrl);
   const contractAddressToName = buildContractNameMap(config);
   const contractIds = Object.keys(contractAddressToName);
 
@@ -70,7 +69,7 @@ async function pollLoop(config: ReturnType<typeof loadConfig>): Promise<void> {
           }
         }
 
-        const maxLedger = Math.max(...response.events.map((e) => e.ledger));
+        const maxLedger = Math.max(...response.events.map((e: { ledger: number }) => e.ledger));
         await updateLastLedger(maxLedger);
         cursor = maxLedger;
 

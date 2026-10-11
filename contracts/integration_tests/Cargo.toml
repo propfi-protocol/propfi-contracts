@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-soroban-sdk = { version = "21" }
+soroban-sdk = { workspace = true }
 propfi-types = { path = "../types" }
 propfi-compliance-registry = { path = "../compliance_registry" }
 propfi-oracle-adapter = { path = "../oracle_adapter" }
@@ -17,4 +17,4 @@ propfi-payment-bridge = { path = "../payment_bridge" }
 propfi-governance = { path = "../governance" }
 
 [dev-dependencies]
-soroban-sdk = { version = "21", features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }
